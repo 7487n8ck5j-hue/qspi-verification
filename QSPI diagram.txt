@@ -1,0 +1,28 @@
+				     +---------------------------+
+                                     |                           |
+                                     |  Direct Memory Access     |
+                                     |  (DMA) Engine             |
+                                     |                           |
+                                     +---------------------------+
+                                         ^   |           ^   |
+                             rx_dma_req  |   |           |   | tx_dma_ack
+                                         |   v           |   v
+                             rx_dma_ack      tx_dma_req
+                                         |   |           |   |
+                                         |   |           |   |
++------------------------+           +---------------------------+           +------------------------+
+|                        |           |                           |           |   TESTBENCH / SLAVE    |
+|                        |---pclk--->|                           |---CS_n--->|   (Mock Flash ROM)     |
+|                        |-presetn-->|                           |---CLK---->|                        |
+|     System CPU /       |---psel--->|      QSPI IP CORE         |--RST_n--->|   Reads Master CMD     |
+|     APB Bus Matrix     |-penable-->|                           |           |   (Listens to D0)      |
+|                        |--pwrite-->|    (qspi_apb_master)      |<===D0====>|                        |
+|  (Executes Software &  |--paddr--->|                           |<===D1====>|<-- Drives Single SPI   |
+|   Reads/Writes Regs)   |--pwdata-->|                           |           |    using: slave_D1     |
+|                        |--pstrb--->|                           |<===D2====>|                        |
+|                        |<--prdata--|                           |<===D3====>|<-- Drives Quad SPI     |
+|                        |<--pready--|                           |           |    using: slave_drv    |
+|                        |<-pslverr--|                           |           |                        |
+|                        |<---irq----|                           |           |   Output Controlled    |
+|                        |           |                           |           |   by: slave_oe         |
++------------------------+           +---------------------------+           +------------------------+
