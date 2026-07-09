@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module tb_test29_dma_hsk;
+// =========================================================================
+// TEST 29: DMA Peripheral Handshaking
+// =========================================================================
+module tb_test_29;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -15,39 +18,46 @@ module tb_test29_dma_hsk;
     assign D1 = slave_oe ? slave_D1 : 1'bz;
     assign D3 = 1'bz; assign D2 = 1'bz; assign D0 = 1'bz;
 
-    qspi_apb_master dut (
-        .pclk(pclk), .presetn(presetn), .psel(psel), .penable(penable), .pwrite(pwrite),
-        .paddr(paddr), .pwdata(pwdata), .pstrb(pstrb), .prdata(prdata), .pready(pready),
-        .pslverr(pslverr), .irq(irq), .rx_dma_req(rx_dma_req), .rx_dma_ack(rx_dma_ack),
-        .tx_dma_req(tx_dma_req), .tx_dma_ack(tx_dma_ack), .CS_n(CS_n), .CLK(CLK),
-        .FLASH_RST_n(FLASH_RST_n), .D3(D3), .D2(D2), .D1(D1), .D0(D0)
-    );
-
+    qspi_apb_master dut (.*);
     always #5 pclk = ~pclk;
 
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; wait(pready);
-        @(negedge pclk); psel=0; penable=0;
+    // Standardized Makefile Tracking
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
     endtask
 
-    // Simulated Fast Flash
-    initial begin
-        forever begin
-            @(negedge CS_n);
-            slave_oe = 1;
-            for (int i=31; i>=0; i--) begin @(negedge CLK); slave_D1 = 1'b1; end
-            @(posedge CS_n); slave_oe = 0;
+    // Robust AMBA Polling
+    task automatic apb_write(input [31:0] addr, input [31:0] data);
+        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
+        psel=0; penable=0;
+    endtask
+
+    // Safe Mock Flash: Drives 1s when active, safely resets on CS_n high
+    always @(negedge CLK or posedge CS_n) begin
+        if (CS_n) begin
+            slave_oe <= 0;
+            slave_D1 <= 1'bz;
+        end else begin
+            slave_oe <= 1;
+            slave_D1 <= 1'b1;
         end
     end
 
     initial begin
-        $dumpfile("dump_test29.vcd"); $dumpvars(0, tb_test29_dma_hsk);
+        bit test_pass = 1'b1;
+        
+        $dumpfile("dump_test_29.vcd"); $dumpvars(0, tb_test_29);
         $display("\n=======================================================================");
-        $display(" TEST 29: QSPI-DMA-HSK-29");
-        $display(" DMA Peripheral Handshaking (Read/Write)");
+        $display(" TEST 29: DMA Peripheral Handshaking (Read/Write)");
         $display(" Validate AXI-like DMA integration");
         $display("=======================================================================\n");
+        
         presetn = 0; #33; presetn = 1; @(posedge pclk);
 
         $display("1. Configuring DMA boundaries: RX Threshold = 1, TX Threshold = 1...");
@@ -63,13 +73,19 @@ module tb_test29_dma_hsk;
         @(negedge pclk); tx_dma_ack = 1'b0; 
         #10;
         
-        if (dut.tx_fifo_cnt == 4'd1) $display("   [PASS] TX Acknowledge successfully populated FIFO.");
-        else $error("   [FAIL] TX Acknowledge failed.");
+        if (dut.tx_fifo_cnt == 4'd1) begin
+            $display("   [PASS] TX Acknowledge successfully populated FIFO.");
+        end else begin
+            $display("   [FAIL] TX Acknowledge failed.");
+            test_pass = 1'b0;
+        end
 
         // --- RX Handshake Test ---
         $display("3. Validating RX Handshake integration...");
         apb_write(32'h00, 32'h0000_0001); // Start RX
-        wait(dut.state == 3'd0 && dut.ctrl_reg[0] == 1'b0); // Wait for flash to feed RX FIFO
+        
+        // Wait for flash to feed RX FIFO
+        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0)) @(posedge pclk);
         
         wait(rx_dma_req == 1'b1);
         $display("   [PASS] RX DMA Request raised automatically after payload receipt.");
@@ -78,10 +94,14 @@ module tb_test29_dma_hsk;
         @(negedge pclk); rx_dma_ack = 1'b0; 
         #10;
 
-        if (dut.rx_fifo_cnt == 4'd0) $display("   [PASS] RX Acknowledge successfully drained FIFO.\n");
-        else $error("   [FAIL] RX Acknowledge failed.");
+        if (dut.rx_fifo_cnt == 4'd0) begin
+            $display("   [PASS] RX Acknowledge successfully drained FIFO.\n");
+        end else begin 
+            $display("   [FAIL] RX Acknowledge failed.\n");
+            test_pass = 1'b0;
+        end
 
-        $display("TEST QSPI-DMA-HSK-29 COMPLETE.\n");
+        update_summary("tb_test_29", test_pass);
         #100 $finish;
     end
 endmodule

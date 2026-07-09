@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module tb_test33_dac_poll;
+// =========================================================================
+// TEST 33: Auto-Polling after DAC Write
+// =========================================================================
+module tb_test_33;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -15,20 +18,24 @@ module tb_test33_dac_poll;
     assign D1 = slave_oe ? slave_D1 : 1'bz;
     assign D3 = 1'bz; assign D2 = 1'bz; assign D0 = 1'bz;
 
-    qspi_apb_master dut (
-        .pclk(pclk), .presetn(presetn), .psel(psel), .penable(penable), .pwrite(pwrite),
-        .paddr(paddr), .pwdata(pwdata), .pstrb(pstrb), .prdata(prdata), .pready(pready),
-        .pslverr(pslverr), .irq(irq), .rx_dma_req(rx_dma_req), .rx_dma_ack(rx_dma_ack),
-        .tx_dma_req(tx_dma_req), .tx_dma_ack(tx_dma_ack), .CS_n(CS_n), .CLK(CLK),
-        .FLASH_RST_n(FLASH_RST_n), .D3(D3), .D2(D2), .D1(D1), .D0(D0)
-    );
-
+    qspi_apb_master dut (.*);
     always #5 pclk = ~pclk;
 
+    // Standardized Makefile Tracking
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
+    endtask
+
+    // Robust AMBA Polling
     task automatic apb_write(input [31:0] addr, input [31:0] data);
         @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; wait(pready);
-        @(negedge pclk); psel=0; penable=0;
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
+        psel=0; penable=0;
     endtask
 
     // Simulated Auto-Poll Response
@@ -37,7 +44,10 @@ module tb_test33_dac_poll;
         int poll_count = 0;
         forever begin
             @(negedge CS_n);
-            for (int i=7; i>=0; i--) begin @(posedge CLK); cmd[i] = (D0 === 1'bz) ? 1'b0 : D0; end
+            for (int i=7; i>=0; i--) begin 
+                @(posedge CLK); 
+                cmd[i] = (D0 === 1'bz) ? 1'b0 : D0; 
+            end
             
             if (cmd == 8'h05) begin // Read Status Register
                 slave_oe = 1;
@@ -48,17 +58,19 @@ module tb_test33_dac_poll;
                 end
                 poll_count++;
             end
-            @(posedge CS_n); slave_oe = 0;
+            @(posedge CS_n); 
+            slave_oe = 0;
         end
     end
 
     initial begin
-        $dumpfile("dump_test33.vcd"); $dumpvars(0, tb_test33_dac_poll);
+        int timeout_ctr = 0;
+        $dumpfile("dump_test_33.vcd"); $dumpvars(0, tb_test_33);
         $display("\n=======================================================================");
-        $display(" TEST 33: QSPI-DAC-POLL-33");
-        $display(" Auto-Polling after DAC Write");
+        $display(" TEST 33: Auto-Polling after DAC Write");
         $display(" Validate automated write cycle tracking");
         $display("=======================================================================\n");
+        
         presetn = 0; #33; presetn = 1; @(posedge pclk);
 
         $display("1. Activating DAC Write configuration...");
@@ -70,11 +82,21 @@ module tb_test33_dac_poll;
         $display("3. Monitoring hardware for autonomous WIP tracking phase...");
         
         // Wait for FSM to naturally execute write -> poll -> poll -> finish
-        wait(dut.state == 3'd0 && dut.ctrl_reg[0] == 1'b0); #20;
+        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0) && timeout_ctr < 5000) begin
+            @(posedge pclk);
+            timeout_ctr++;
+        end
 
-        $display("   [PASS] Hardware auto-polling sequence verified. Write cycle resolved cleanly.\n");
+        #20;
 
-        $display("TEST QSPI-DAC-POLL-33 COMPLETE.\n");
+        if (timeout_ctr < 5000) begin
+            $display("   [PASS] Hardware auto-polling sequence verified. Write cycle resolved cleanly.\n");
+            update_summary("tb_test_33", 1);
+        end else begin
+            $display("   [FAIL] Hardware timed out or locked up during polling phase.\n");
+            update_summary("tb_test_33", 0);
+        end
+
         #100 $finish;
     end
 endmodule

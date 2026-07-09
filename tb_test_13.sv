@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module tb_test13_por;
+// =========================================================================
+// TEST 13: APB Register POR Default Validation (QSPI-APB-RST-13)
+// =========================================================================
+module tb_test_13;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -11,31 +14,36 @@ module tb_test13_por;
     wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
     wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
 
-    assign D3 = 1'bz; assign D2 = 1'bz; assign D1 = 1'bz; assign D0 = 1'bz;
+    pullup(D3); pullup(D2); pullup(D1); pullup(D0);
 
-    qspi_apb_master dut (
-        .pclk(pclk), .presetn(presetn), .psel(psel), .penable(penable), .pwrite(pwrite),
-        .paddr(paddr), .pwdata(pwdata), .pstrb(pstrb), .prdata(prdata), .pready(pready),
-        .pslverr(pslverr), .irq(irq), .rx_dma_req(rx_dma_req), .rx_dma_ack(rx_dma_ack),
-        .tx_dma_req(tx_dma_req), .tx_dma_ack(tx_dma_ack), .CS_n(CS_n), .CLK(CLK),
-        .FLASH_RST_n(FLASH_RST_n), .D3(D3), .D2(D2), .D1(D1), .D0(D0)
-    );
-
+    qspi_apb_master dut (.*);
     always #5 pclk = ~pclk;
 
+    // Standardized Makefile Tracking
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
+    endtask
+
+    // Robust AMBA Polling (Read Only Needed Here)
     task automatic apb_read(input [31:0] addr, output logic [31:0] data);
         @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; wait(pready);
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
         data = prdata;
-        @(negedge pclk); psel=0; penable=0;
+        psel=0; penable=0;
     endtask
 
     initial begin
         logic [31:0] val;
-        $dumpfile("dump_test13.vcd"); $dumpvars(0, tb_test13_por);
+        bit test_pass = 1'b1;
+        
+        $dumpfile("dump_test_13.vcd"); $dumpvars(0, tb_test_13);
         $display("\n=======================================================================");
-        $display(" TEST 13: QSPI-APB-RST-13");
-        $display(" APB Register POR Default Validation");
+        $display(" TEST 13: APB Register POR Default Validation");
         $display(" Validate Power-On Reset (POR) register states.");
         $display("=======================================================================\n");
         
@@ -45,22 +53,40 @@ module tb_test13_por;
         $display("2. Checking architectural defaults...");
         
         apb_read(32'h00, val);
-        if (val === 32'h0000_0044) $display("   [PASS] CTRL_REG (0x00) POR is 0x0000_0044");
-        else $error("   [FAIL] CTRL_REG POR Mismatch! Got: %h", val);
+        if (val === 32'h0000_0044) begin
+            $display("   [PASS] CTRL_REG (0x00) POR is 0x0000_0044");
+        end else begin 
+            $display("   [FAIL] CTRL_REG POR Mismatch! Got: %h", val);
+            test_pass = 1'b0;
+        end
 
         apb_read(32'h14, val);
-        if (val === 32'h0000_0000) $display("   [PASS] DUMMY_CTRL (0x14) POR is 0x0000_0000");
-        else $error("   [FAIL] DUMMY_CTRL POR Mismatch! Got: %h", val);
+        if (val === 32'h0000_0000) begin
+            $display("   [PASS] DUMMY_CTRL (0x14) POR is 0x0000_0000");
+        end else begin 
+            $display("   [FAIL] DUMMY_CTRL POR Mismatch! Got: %h", val);
+            test_pass = 1'b0;
+        end
 
         apb_read(32'h24, val);
-        if (val === 32'h0000_0000) $display("   [PASS] TIMEOUT_CTRL (0x24) POR is 0x0000_0000");
-        else $error("   [FAIL] TIMEOUT_CTRL POR Mismatch! Got: %h", val);
+        if (val === 32'h0000_0000) begin
+            $display("   [PASS] TIMEOUT_CTRL (0x24) POR is 0x0000_0000");
+        end else begin 
+            $display("   [FAIL] TIMEOUT_CTRL POR Mismatch! Got: %h", val);
+            test_pass = 1'b0;
+        end
 
         apb_read(32'h28, val);
-        if (val === 32'h0000_0000) $display("   [PASS] DMA_CTRL (0x28) POR is 0x0000_0000");
-        else $error("   [FAIL] DMA_CTRL POR Mismatch! Got: %h", val);
+        if (val === 32'h0000_0000) begin
+            $display("   [PASS] DMA_CTRL (0x28) POR is 0x0000_0000\n");
+        end else begin 
+            $display("   [FAIL] DMA_CTRL POR Mismatch! Got: %h\n", val);
+            test_pass = 1'b0;
+        end
 
-        $display("\nTEST QSPI-APB-RST-13 COMPLETE.\n");
+        // Log final unified result to Makefile
+        update_summary("tb_test_13", test_pass);
+        
         #100 $finish;
     end
 endmodule

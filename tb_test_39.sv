@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module tb_test39_overrun;
+// =========================================================================
+// TEST 39: SRAM Overrun / Back-Pressure Handling
+// =========================================================================
+module tb_test_39;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -16,26 +19,40 @@ module tb_test39_overrun;
 
     always #5 pclk = ~pclk;
 
+    // Standardized Makefile Tracking
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
+    endtask
+
+    // Robust AMBA Polling
     task automatic apb_write(input [31:0] addr, input [31:0] data);
         @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; wait(pready);
-        @(negedge pclk); psel=0; penable=0;
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
+        psel=0; penable=0;
     endtask
 
     task automatic apb_read(input [31:0] addr, output logic [31:0] data);
         @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; wait(pready);
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
         data = prdata;
-        @(negedge pclk); psel=0; penable=0;
+        psel=0; penable=0;
     endtask
 
     initial begin
         logic [31:0] val;
-        $dumpfile("dump_test39.vcd"); $dumpvars(0, tb_test39_overrun);
+        bit test_pass = 1'b1;
+
+        $dumpfile("dump_test_39.vcd"); $dumpvars(0, tb_test_39);
         $display("\n=======================================================================");
-        $display(" TEST 39: QSPI-IND-LVL-39");
-        $display(" SRAM Overrun / Back-Pressure Handling");
+        $display(" TEST 39: SRAM Overrun / Back-Pressure Handling (QSPI-IND-LVL-39)");
         $display("=======================================================================\n");
+        
         presetn = 0; #33; presetn = 1; @(posedge pclk);
 
         $display("1. Pushing 10 words into the 8-word TX FIFO...");
@@ -45,12 +62,14 @@ module tb_test39_overrun;
 
         apb_read(32'h00, val);
 
-        if (dut.tx_fifo_cnt == 4'd8 && val[5] == 1'b1) 
+        if (dut.tx_fifo_cnt == 4'd8 && val[5] == 1'b1) begin
             $display("   [PASS] Hardware throttled queue at 8. TX_Full flag successfully asserted.\n");
-        else 
-            $error("   [FAIL] Hardware failed to clamp queue size.\n");
+        end else begin
+            $display("   [FAIL] Hardware failed to clamp queue size. (Count: %0d, TX_Full: %b)\n", dut.tx_fifo_cnt, val[5]);
+            test_pass = 1'b0;
+        end
 
-        $display("TEST QSPI-IND-LVL-39 COMPLETE.\n");
+        update_summary("tb_test_39", test_pass);
         #100 $finish;
     end
 endmodule

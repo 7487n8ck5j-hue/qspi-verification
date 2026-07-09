@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module tb_test41_irq;
+// =========================================================================
+// TEST 41: System Interrupt Generation & Clearing
+// =========================================================================
+module tb_test_41;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -16,19 +19,32 @@ module tb_test41_irq;
 
     always #5 pclk = ~pclk;
 
+    // Standardized Makefile Tracking
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
+    endtask
+
+    // Robust AMBA Polling
     task automatic apb_write(input [31:0] addr, input [31:0] data);
         @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; wait(pready);
-        @(negedge pclk); psel=0; penable=0;
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
+        psel=0; penable=0;
     endtask
 
     initial begin
         int timeout_ctr = 0;
-        $dumpfile("dump_test41.vcd"); $dumpvars(0, tb_test41_irq);
+        bit test_pass = 1'b1;
+
+        $dumpfile("dump_test_41.vcd"); $dumpvars(0, tb_test_41);
         $display("\n=======================================================================");
-        $display(" TEST 41: QSPI-APB-REG-41");
-        $display(" System Interrupt Generation & Clearing");
+        $display(" TEST 41: System Interrupt Generation & Clearing (QSPI-APB-REG-41)");
         $display("=======================================================================\n");
+        
         presetn = 0; #33; presetn = 1; @(posedge pclk);
 
         $display("1. Triggering transfer with Global Interrupts ENABLED...");
@@ -41,8 +57,12 @@ module tb_test41_irq;
             @(posedge pclk); timeout_ctr++;
         end
 
-        if (irq === 1'b1) $display("   [PASS] System Interrupt Generated! 'irq' pin HIGH.");
-        else $error("   [FAIL] Hardware failed to generate interrupt upon completion.");
+        if (irq === 1'b1) begin
+            $display("   [PASS] System Interrupt Generated! 'irq' pin HIGH.");
+        end else begin
+            $display("   [FAIL] Hardware failed to generate interrupt upon completion.");
+            test_pass = 1'b0;
+        end
 
         $display("2. CPU Acknowledging: Writing '1' to Interrupt Status to clear...");
         // Keep IntEn (Bit 3), Write 1 to clear IntSts (Bit 4) -> 0x18
@@ -50,10 +70,14 @@ module tb_test41_irq;
 
         #10; 
         
-        if (irq === 1'b0) $display("   [PASS] System Interrupt Cleared! 'irq' pin safely LOW.\n");
-        else $error("   [FAIL] Interrupt line stuck HIGH after W1C operation.\n");
+        if (irq === 1'b0) begin
+            $display("   [PASS] System Interrupt Cleared! 'irq' pin safely LOW.\n");
+        end else begin
+            $display("   [FAIL] Interrupt line stuck HIGH after W1C operation.\n");
+            test_pass = 1'b0;
+        end
 
-        $display("TEST QSPI-APB-REG-41 COMPLETE.\n");
+        update_summary("tb_test_41", test_pass);
         #100 $finish;
     end
 endmodule

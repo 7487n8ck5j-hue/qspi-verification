@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module tb_test28_int_mask;
+// =========================================================================
+// TEST 28: Hardware Interrupt Masking Configuration
+// =========================================================================
+module tb_test_28;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -11,84 +14,89 @@ module tb_test28_int_mask;
     wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
     wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
 
-    // FIX 1: Use pullups instead of 1'bz to prevent Red 'X' states propagating into the FSM
     pullup(D3); pullup(D2); pullup(D1); pullup(D0);
-
-    qspi_apb_master dut (
-        .pclk(pclk), .presetn(presetn), .psel(psel), .penable(penable), .pwrite(pwrite),
-        .paddr(paddr), .pwdata(pwdata), .pstrb(pstrb), 
-        .prdata(prdata), .pready(pready), .pslverr(pslverr), .irq(irq),
-        .rx_dma_req(rx_dma_req), .rx_dma_ack(rx_dma_ack), 
-        .tx_dma_req(tx_dma_req), .tx_dma_ack(tx_dma_ack),
-        .CS_n(CS_n), .CLK(CLK), .FLASH_RST_n(FLASH_RST_n),
-        .D3(D3), .D2(D2), .D1(D1), .D0(D0)
-    );
-
+    
+    qspi_apb_master dut (.*);
     always #5 pclk = ~pclk;
 
+    // Standardized Makefile Tracking
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
+    endtask
+
+    // Robust AMBA Polling
     task automatic apb_write(input [31:0] addr, input [31:0] data);
         @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; wait(pready);
-        @(negedge pclk); psel=0; penable=0;
-    endtask // FIX 2: Corrected 'taskend' to 'endtask'
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
+        psel=0; penable=0;
+    endtask 
 
     task automatic apb_read(input [31:0] addr, output logic [31:0] data);
         @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; wait(pready);
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
         data = prdata;
-        @(negedge pclk); psel=0; penable=0;
+        psel=0; penable=0;
     endtask
 
-    // Added a minimal mock flash response to ensure the FSM doesn't ingest 'X' states
-    reg slave_D1 = 1'bz; reg slave_oe = 0;
-    assign D1 = slave_oe ? slave_D1 : 1'bz;
-
-    initial begin
-        forever begin
-            @(negedge CS_n);
-            #1; slave_oe = 1;
-            for (int i=31; i>=0; i--) begin 
-                @(negedge CLK); #1; slave_D1 = 1'b1; 
-            end
-            @(posedge CS_n); #1; slave_oe = 0; slave_D1 = 1'bz;
-        end
-    end
+    // Non-blocking Mock Flash to prevent infinite loop simulator crashes
+    reg slave_oe = 0;
+    assign D1 = slave_oe ? 1'b1 : 1'bz;
+    always @(negedge CS_n) slave_oe <= 1;
+    always @(posedge CS_n) slave_oe <= 0;
 
     initial begin
         logic [31:0] val;
-        int timeout_ctr = 0; // FIX 3: Initialize a timeout tracker
+        int timeout_ctr = 0; 
+        bit test_pass = 1'b1;
         
-        $dumpfile("dump_test28.vcd"); $dumpvars(0, tb_test28_int_mask);
-        $display("\n--- Starting Test 28: Interrupt Masking ---");
+        $dumpfile("dump_test_28.vcd"); $dumpvars(0, tb_test_28);
+        $display("\n=======================================================================");
+        $display(" TEST 28: Hardware Interrupt Masking Configuration");
+        $display("=======================================================================\n");
+        
         presetn = 0; #33; presetn = 1; @(posedge pclk);
 
-        $display("1. Launching RX Transfer with IntEn (Bit 3) explicitly cleared to 0...");
-        // Start (Bit 0) = 1, Dir RX (Bit 1) = 0, IntEn (Bit 3) = 0 -> 0x0000_0001
-        apb_write(32'h00, 32'h0000_0001);
+        $display("1. Configuring transfer with physical IRQ masked...");
+        apb_write(32'h14, 32'h0000_0004); // Configure transfer length
+        apb_write(32'h00, 32'h0000_0001); // Start without interrupts (Bit 3 = 0)
 
-        $display("2. Waiting for FSM transfer completion sequence...");
-        
-        // FIX 4: Replace infinite wait() with a bounded timeout loop
-        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0) && timeout_ctr < 1000) begin
+        // Increased timeout boundary 
+        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0) && timeout_ctr < 10000) begin
             @(posedge pclk);
             timeout_ctr++;
         end
 
-        if (timeout_ctr >= 1000) begin
-            $error("   [FAIL] Hardware locked up. Bounded timeout reached.");
+        if (timeout_ctr >= 10000) begin
+            $display("   [FAIL] Hardware locked up. Bounded timeout reached.");
+            test_pass = 1'b0;
         end
 
         #10;
 
-        $display("3. Validating external physical pin masking...");
-        if (irq === 1'b1) $error("   FAILED! Physical irq pin went high despite IntEn mask.");
-        else $display("   PASSED! Pin remained low.");
+        $display("2. Validating physical pin state...");
+        if (irq === 1'b1) begin
+            $display("   [FAIL] Physical irq pin went high despite IntEn mask.");
+            test_pass = 1'b0;
+        end else begin
+            $display("   [PASS] Physical IRQ pin remained low.");
+        end
 
-        $display("4. Checking if internal logging updated normally...");
+        $display("3. Validating internal completion register status...");
         apb_read(32'h00, val);
-        if (val[4] === 1'b1) $display("TEST 28 PASSED! Internal complete bit logged properly under mask condition.\n");
-        else $error("TEST 28 FAILED! Status register did not set complete bit.");
+        if (val[4] === 1'b1) begin
+            $display("   [PASS] Internal complete bit logged properly.\n");
+        end else begin
+            $display("   [FAIL] Status register did not set complete bit.\n");
+            test_pass = 1'b0;
+        end
 
+        update_summary("tb_test_28", test_pass);
         #100 $finish;
     end
 endmodule

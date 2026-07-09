@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module tb_test23_sram_partition;
+// =========================================================================
+// TEST 23: SRAM Partition Configuration
+// =========================================================================
+module tb_test_23;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -13,29 +16,35 @@ module tb_test23_sram_partition;
 
     assign D3 = 1'bz; assign D2 = 1'bz; assign D1 = 1'bz; assign D0 = 1'bz;
 
-    qspi_apb_master dut (
-        .pclk(pclk), .presetn(presetn), .psel(psel), .penable(penable), .pwrite(pwrite),
-        .paddr(paddr), .pwdata(pwdata), .pstrb(pstrb), .prdata(prdata), .pready(pready),
-        .pslverr(pslverr), .irq(irq), .rx_dma_req(rx_dma_req), .rx_dma_ack(rx_dma_ack),
-        .tx_dma_req(tx_dma_req), .tx_dma_ack(tx_dma_ack), .CS_n(CS_n), .CLK(CLK),
-        .FLASH_RST_n(FLASH_RST_n), .D3(D3), .D2(D2), .D1(D1), .D0(D0)
-    );
-
+    qspi_apb_master dut (.*);
     always #5 pclk = ~pclk;
 
+    // Standardized Makefile Tracking
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
+    endtask
+
+    // Robust AMBA Polling
     task automatic apb_write(input [31:0] addr, input [31:0] data);
         @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; wait(pready);
-        @(negedge pclk); psel=0; penable=0;
+        @(negedge pclk); penable=1; 
+        do begin @(negedge pclk); end while(pready == 1'b0);
+        psel=0; penable=0;
     endtask
 
     initial begin
-        $dumpfile("dump_test23.vcd"); $dumpvars(0, tb_test23_sram_partition);
+        bit test_pass = 1'b1;
+        
+        $dumpfile("dump_test_23.vcd"); $dumpvars(0, tb_test_23);
         $display("\n=======================================================================");
-        $display(" TEST 23: QSPI-APB-PAR-23");
-        $display(" SRAM Partition Configuration");
+        $display(" TEST 23: SRAM Partition Configuration (QSPI-APB-PAR-23)");
         $display(" Validate internal SRAM memory division");
         $display("=======================================================================\n");
+        
         presetn = 0; #33; presetn = 1; @(posedge pclk);
 
         $display("1. Configuring strict SRAM partition thresholds (DMA_CTRL)...");
@@ -44,14 +53,24 @@ module tb_test23_sram_partition;
 
         $display("2. Verifying TX boundary logic response...");
         #10;
-        if (tx_dma_req === 1'b1) $display("   [PASS] TX Memory partition evaluated correctly (Empty queue requested data).");
-        else $error("   [FAIL] TX Memory partition evaluation failed.");
+        if (tx_dma_req === 1'b1) begin
+            $display("   [PASS] TX Memory partition evaluated correctly (Empty queue requested data).");
+        end else begin
+            $display("   [FAIL] TX Memory partition evaluation failed.");
+            test_pass = 1'b0;
+        end
 
         $display("3. Verifying RX boundary logic response...");
-        if (rx_dma_req === 1'b0) $display("   [PASS] RX Memory partition evaluated correctly (Empty queue blocked read request).");
-        else $error("   [FAIL] RX Memory partition evaluation failed.");
+        if (rx_dma_req === 1'b0) begin
+            $display("   [PASS] RX Memory partition evaluated correctly (Empty queue blocked read request).\n");
+        end else begin
+            $display("   [FAIL] RX Memory partition evaluation failed.\n");
+            test_pass = 1'b0;
+        end
 
-        $display("\nTEST QSPI-APB-PAR-23 COMPLETE.\n");
+        // Log final unified result to Makefile
+        update_summary("tb_test_23", test_pass);
+        
         #100 $finish;
     end
 endmodule

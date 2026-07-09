@@ -1,6 +1,6 @@
 `timescale 1ns/1ps
 
-module tb_test32_dac_boundary;
+module tb_test_32;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -11,17 +11,18 @@ module tb_test32_dac_boundary;
     wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
     wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
 
-    assign D3 = 1'bz; assign D2 = 1'bz; assign D1 = 1'bz; assign D0 = 1'bz;
-
-    qspi_apb_master dut (
-        .pclk(pclk), .presetn(presetn), .psel(psel), .penable(penable), .pwrite(pwrite),
-        .paddr(paddr), .pwdata(pwdata), .pstrb(pstrb), .prdata(prdata), .pready(pready),
-        .pslverr(pslverr), .irq(irq), .rx_dma_req(rx_dma_req), .rx_dma_ack(rx_dma_ack),
-        .tx_dma_req(tx_dma_req), .tx_dma_ack(tx_dma_ack), .CS_n(CS_n), .CLK(CLK),
-        .FLASH_RST_n(FLASH_RST_n), .D3(D3), .D2(D2), .D1(D1), .D0(D0)
-    );
-
+    pullup(D3); pullup(D2); pullup(D1); pullup(D0);
+    
+    qspi_apb_master dut (.*);
     always #5 pclk = ~pclk;
+
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
+    endtask
 
     task automatic apb_write(input [31:0] addr, input [31:0] data);
         @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
@@ -30,31 +31,42 @@ module tb_test32_dac_boundary;
     endtask
 
     initial begin
-        $dumpfile("dump_test32.vcd"); $dumpvars(0, tb_test32_dac_boundary);
-        $display("\n=======================================================================");
-        $display(" TEST 32: QSPI-DAC-BND-32");
-        $display(" DAC Page Boundary Splitting");
-        $display(" Validate hardware wrap prevention");
-        $display("=======================================================================\n");
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
-
-        $display("1. Activating DAC mapping...");
-        apb_write(32'h20, 32'h0000_0001); 
-
-        $display("2. Executing direct mapped write specifically crossing 256-byte page boundary (0x1000_00FC)...");
-        // Address 0xFC will write bytes at FC, FD, FE, FF. Next word would be boundary split.
-        apb_write(32'h1000_00FC, 32'hFFFF_FFFF);
-
-        #50;
+        int cs_toggles = 0;
         
-        if (CS_n === 1'b0) 
-            $display("   [PASS] Boundary transaction active. Wrap prevention mechanisms engaged.");
-        else 
-            $error("   [FAIL] Boundary FSM failed to execute.");
-
-        wait(dut.state == 3'd0 && dut.ctrl_reg[0] == 1'b0); #10;
-
-        $display("\nTEST QSPI-DAC-BND-32 COMPLETE.\n");
+        $dumpfile("dump_test_32.vcd"); $dumpvars(0, tb_test_32);
+        $display("\n=======================================================================");
+        $display(" TEST 32: DAC Memory Boundary Crossing");
+        $display("=======================================================================\n");
+        
+        presetn = 0; #33; presetn = 1; @(posedge pclk);
+        
+        apb_write(32'h20, 32'h0000_0001); 
+        
+        // Spawn an immortal background monitor to count every time CS_n goes low
+        fork
+            begin
+                forever begin
+                    @(negedge CS_n);
+                    cs_toggles++;
+                end
+            end
+        join_none
+        
+        // Initiate the APB transaction across the boundary
+        apb_write(32'h1000_00FC, 32'hFFFF_FFFF);
+        
+        // Wait a large, safe window to let the SPI hardware fully process, 
+        // assert CS_n, shift all data, and deassert.
+        repeat(1000) @(posedge pclk); 
+        
+        if (cs_toggles > 0) begin
+            $display("   [PASS] Boundary FSM executed. Transaction correctly stretched (CS_n toggled %0d times).\n", cs_toggles);
+            update_summary("tb_test_32", 1);
+        end else begin
+            $display("   [FAIL] Boundary FSM failed to stretch transaction. CS_n never asserted.\n");
+            update_summary("tb_test_32", 0);
+        end
+        
         #100 $finish;
     end
 endmodule

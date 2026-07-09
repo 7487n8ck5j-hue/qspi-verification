@@ -1,6 +1,9 @@
 `timescale 1ns/1ps
 
-module tb_test2_reset;
+// =========================================================================
+// TEST 02: Hardware Flash Reset Pin Validation
+// =========================================================================
+module tb_test_02;
 
     logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
     logic [31:0] paddr = 0, pwdata = 0; 
@@ -11,19 +14,23 @@ module tb_test2_reset;
     wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
     wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
 
-    assign D3 = 1'bz; assign D2 = 1'bz; assign D1 = 1'bz; assign D0 = 1'bz;
+    pullup(D3); pullup(D2); pullup(D1); pullup(D0);
+    
+    reg slave_D1 = 1'bz; 
+    reg slave_oe = 0;
+    assign D1 = slave_oe ? slave_D1 : 1'bz;
 
-    qspi_apb_master dut (
-        .pclk(pclk), .presetn(presetn), .psel(psel), .penable(penable), .pwrite(pwrite),
-        .paddr(paddr), .pwdata(pwdata), .pstrb(pstrb), 
-        .prdata(prdata), .pready(pready), .pslverr(pslverr), .irq(irq),
-        .rx_dma_req(rx_dma_req), .rx_dma_ack(rx_dma_ack), 
-        .tx_dma_req(tx_dma_req), .tx_dma_ack(tx_dma_ack),
-        .CS_n(CS_n), .CLK(CLK), .FLASH_RST_n(FLASH_RST_n),
-        .D3(D3), .D2(D2), .D1(D1), .D0(D0)
-    );
-
+    qspi_apb_master dut (.*);
     always #5 pclk = ~pclk;
+
+    // FIX: Standardized update_summary to always require test name and result
+    task automatic update_summary(input string test_name, input bit pass);
+        int fd = $fopen("regression_summary.txt", "a");
+        if (fd) begin
+            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
+            $fclose(fd);
+        end
+    endtask
 
     task automatic apb_write(input [31:0] addr, input [31:0] data);
         @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
@@ -32,25 +39,47 @@ module tb_test2_reset;
     endtask
 
     initial begin
-        $dumpfile("dump_test2.vcd"); $dumpvars(0, tb_test2_reset);
-        $display("\n--- Starting Test 2: Hardware Flash Reset ---");
+        $dumpfile("dump_test_02.vcd"); 
+        $dumpvars(0, tb_test_02);
+        
+        $display("\n=======================================================================");
+        $display(" TEST 02: Hardware Flash Reset Pin Validation");
+        $display("=======================================================================\n");
+
         presetn = 0; #33; presetn = 1; @(posedge pclk);
-
         #10;
-        if (FLASH_RST_n === 1'b1) $display("1. Default State is HIGH (Correct)");
-        else $error("1. Default State FAILED");
 
-        $display("2. Pulling Reset LOW via APB...");
-        apb_write(32'h00, 32'h0000_0000); // Clear Bit 2
-        #10;
-        if (FLASH_RST_n === 1'b0) $display("   Reset successfully pulled LOW.");
-        else $error("   Failed to pull Reset LOW.");
+        if (FLASH_RST_n === 1'b1) begin
+            $display("   [PASS] 1. Default state HIGH.");
+        end else begin 
+            $display("   [FAIL] 1. Default state not HIGH."); 
+            update_summary("tb_test_02", 0); 
+            $finish; 
+        end
 
-        $display("3. Restoring Reset HIGH...");
-        apb_write(32'h00, 32'h0000_0004); // Set Bit 2
+        $display("   [INFO] 2. Pulling Reset LOW via APB...");
+        apb_write(32'h00, 32'h0000_0000); 
         #10;
-        if (FLASH_RST_n === 1'b1) $display("TEST 2 PASSED! Pin behavior verified.");
-        else $error("TEST 2 FAILED!");
+        
+        if (FLASH_RST_n === 1'b0) begin
+            $display("   [PASS] 2. Reset pulled LOW.");
+        end else begin 
+            $display("   [FAIL] 2. Failed to pull LOW."); 
+            update_summary("tb_test_02", 0); 
+            $finish; 
+        end
+
+        $display("   [INFO] 3. Restoring Reset HIGH...");
+        apb_write(32'h00, 32'h0000_0004); 
+        #10;
+
+        if (FLASH_RST_n === 1'b1) begin
+            $display("   [PASS] TEST 02 PASSED! Pin behavior verified.\n");
+            update_summary("tb_test_02", 1);
+        end else begin
+            $display("   [FAIL] TEST 02 FAILED!\n");
+            update_summary("tb_test_02", 0);
+        end
 
         #100 $finish;
     end
