@@ -2,39 +2,54 @@
 # QSPI 41-Test Master Regression Makefile
 # ==============================================================================
 
-# Toolchain: Synopsys VCS
+# Define the compiler and its flags.
+# -sverilog enables SystemVerilog features.
+# -full64 runs in 64-bit mode.
+# -debug_access+all enables waveform dumping (VCD/FSDB).
 VCS     = vcs
 CFLAGS  = -sverilog -full64 -debug_access+all -timescale=1ns/1ps
 
-# Project Files
+# Automatically find all testbench files matching "QSPI-*.sv" in the folder,
+# and sort them numerically based on the test number at the end of the filename.
 DESIGN  = design.sv
-TESTS   = $(sort $(wildcard tb_test_*.sv))
+TESTS   = $(shell ls QSPI-*.sv 2>/dev/null | awk -F'-' '{print $$NF, $$0}' | sort -n | cut -d' ' -f2-)
 
-# Output Directories & Files
+# Define where output files will go to keep the root directory clean.
 BUILD_DIR   = build
 LOG_DIR     = logs
 REPORT_FILE = regression_report.txt
 
 .PHONY: all regress summary clean dirs
 
-# Default target
+# The default command when you just type 'make'. 
+# It runs in order: creates folders -> runs tests -> prints summary.
 all: dirs regress summary
 
 # 1. Ensure directories exist
+# Creates the build and log folders safely (-p prevents errors if they already exist).
 dirs:
 	@mkdir -p $(BUILD_DIR) $(LOG_DIR)
 
 # 2. Compile and run all tests
+# Loops through every testbench. 
+# FIX APPLIED: Added an 'if' statement. If VCS fails to build the executable, 
+# it safely writes a [FAIL] to the log instead of crashing the flow.
 regress: dirs
 	@echo "Starting Regression Suite..."
 	@for test in $(TESTS); do \
 		echo "--------------------------------------------------------"; \
 		echo "--> Running $$test"; \
 		$(VCS) $(CFLAGS) -o $(BUILD_DIR)/simv_$$test $(DESIGN) $$test; \
-		./$(BUILD_DIR)/simv_$$test | tee $(LOG_DIR)/$$test.log; \
+		if [ -x $(BUILD_DIR)/simv_$$test ]; then \
+			./$(BUILD_DIR)/simv_$$test | tee $(LOG_DIR)/$$test.log; \
+		else \
+			echo "      -> Error: [FAIL] VCS Compilation Error. Check syntax." > $(LOG_DIR)/$$test.log; \
+		fi; \
 	done
 
 # 3. Print the Detailed Pass/Fail Summary AND Save to File
+# Parses every log file looking for the words [PASS] or [FAIL].
+# Prints colorful results to the terminal and plain text to regression_report.txt.
 summary:
 	@echo ""
 	@rm -f $(REPORT_FILE)
@@ -80,6 +95,8 @@ summary:
 	@echo "--> Detailed report successfully saved to: $(REPORT_FILE)"
 
 # 4. Cleanup
+# Deletes all generated binaries, logs, waveforms, and directories 
+# to return the folder to a pristine state.
 clean:
 	@echo "--> Cleaning up workspace..."
 	@rm -rf $(BUILD_DIR) $(LOG_DIR) *.daidir csrc *.vcd *.log *.key vc_hdrs.h $(REPORT_FILE) regression_summary.txt

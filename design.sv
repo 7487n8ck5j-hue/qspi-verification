@@ -37,13 +37,15 @@ module qspi_apb_master (
     reg [31:0] rx_reg;    
     reg [31:0] dummy_ctrl;
     reg [31:0] timeout_ctrl; // 0x24
-    
-    // DMA_CTRL (0x28): Bit 0 = TX DMA Enable, Bit 1 = RX DMA Enable, Bits 15:8 = TX Watermark, Bits 23:16 = RX Watermark
     reg [31:0] dma_ctrl;
 
     reg [3:0]  tx_fifo_cnt;
     reg [3:0]  rx_fifo_cnt;
     reg [31:0] timer_cnt;
+
+    // NEW: Boundary Logic Registers
+    reg [31:0] addr_ptr; 
+    wire page_boundary_hit = (addr_ptr[7:0] == 8'hFF);
 
     localparam IDLE = 3'd0, TX = 3'd1, DUMMY = 3'd2, RX = 3'd3, STOP = 3'd4;
     reg [2:0]  state;
