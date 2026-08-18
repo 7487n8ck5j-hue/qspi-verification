@@ -1,118 +1,114 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 03: Status Register Polling (WIP Check)
+// TEST 03: Status Register Polling (WIP Check) (QSPI-PHY-POL-03)
+// Comprehensive diagnostic sequence validating iterative SPI reads, 
+// WIP (Write-In-Progress) bit extraction, and APB-to-SPI clock domain sync.
 // =========================================================================
-module tb_test_03;
-    
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; logic [3:0] pstrb = 4'b1111;
-    logic rx_dma_ack = 0, tx_dma_ack = 0;
-    
-    wire [31:0] prdata; wire pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // Pullups simulate physical board resistors, preventing data lines from
-    // floating to an unknown 'x' state. D1 (MISO) is dynamically driven 
-    // by the mock slave only when 'slave_oe' is active.
-    // =====================================================================
-    pullup(D3); pullup(D2); pullup(D1); pullup(D0);
-    
-    reg slave_D1 = 1'bz; reg slave_oe = 0;
-    assign D1 = slave_oe ? slave_D1 : 1'bz;
+task automatic run_test_03(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    int poll_count = 0;
+    logic [31:0] val = 32'h0000_0001; 
+    int timeout_ctr = 0;
+    bit test_pass = 1'b1;
 
-    qspi_apb_master dut (.*);
-    always #5 pclk = ~pclk;
+    $display("\n=======================================================================");
+    $display(" TEST 03: Status Register Polling (WIP Check)");
+    $display(" Target: QSPI-PHY-POL-03 | Iterative FSM Polling & Payload Extraction");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write/read: Replicates a cycle-accurate AMBA APB protocol.
-    // =====================================================================
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
-
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; wait(pready);
-        @(negedge pclk); psel=0; penable=0;
-    endtask
-
-    task automatic apb_read(input [31:0] addr, output logic [31:0] data);
-        @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; wait(pready); data = prdata;
-        @(negedge pclk); psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Mock SPI Flash Memory (The Slave)
-    // ---------------------------------------------------------------------
-    // Simulates a Flash memory chip responding to a Status Register read.
-    // It intentionally forces the Write-In-Progress (WIP) bit (the LSB) 
-    // to '1' for the first 3 polls to simulate the flash being busy, 
-    // then clears it to '0' to signal readiness.
-    // =====================================================================
-    initial begin
-        int poll_count = 0;
-        forever begin
-            @(negedge CS_n);
-            slave_oe = 1;
-            for (int i=7; i>=0; i--) begin 
-                slave_D1 = (i == 0 && poll_count < 3) ? 1'b1 : 1'b0;
-                if (i > 0) @(negedge CLK);
+    // We use fork..join_any to run the Master APB polling and the Custom Slave response simultaneously
+    fork
+        // ---------------------------------------------------------
+        // THREAD 1: Custom Mock Slave (Simulates the WIP bit)
+        // ---------------------------------------------------------
+        begin : custom_mock_slave
+            forever begin
+                @(negedge vif.CS_n);
+                #1; // Delta-cycle safety
+                // Shift out 8 bits. Simulate WIP (Bit 0) being HIGH for the first 3 polls.
+                for (int i=7; i>=0; i--) begin 
+                    if (i == 0 && poll_count < 3) begin
+                        vif.D1 <= 1'b1;
+                    end else begin
+                        vif.D1 <= 1'b0;
+                    end
+                    
+                    if (i > 0) @(negedge vif.CLK);
+                end
+                poll_count++;
+                @(posedge vif.CS_n); 
+                #1;
+                vif.D1 <= 1'bz; // Return bus to High-Z
             end
-            poll_count++;
-            @(posedge CS_n); 
-            slave_oe = 0; slave_D1 = 1'bz;
         end
+
+        // ---------------------------------------------------------
+        // THREAD 2: QSPI Master Polling Sequence
+        // ---------------------------------------------------------
+        begin : master_apb_polling
+            $display("[INFO] --- STEP 1: Configuring Master Architecture ---");
+            // FIX: Must configure Clock Divider and Transfer Length to prevent 0-length FSM locks.
+            // Clock Divider = 4
+            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; agt.send_write(tx); 
+            // Transfer Length = 1 Byte (8 bits for a standard Status Register read)
+            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_0001; agt.send_write(tx);
+            
+            $display("[INFO] --- STEP 2: Initiating Polling Loop ---");
+            // Keep polling via APB as long as the WIP bit is 1, up to 50 attempts
+            while (val[0] == 1'b1 && timeout_ctr < 50) begin
+                
+                $display("   [DEBUG] Polling Attempt %0d...", timeout_ctr + 1);
+                
+                // 1. Trigger the SPI Read transaction
+                tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; 
+                agt.send_write(tx); 
+                
+                // FIX: Allow CDC propagation delay before checking the FSM active status
+                repeat(10) @(posedge vif.pclk);
+
+                // 2. Wait for the QSPI hardware FSM to return to idle
+                do begin
+                    tx = new(); tx.paddr = 32'h00; 
+                    agt.send_read(tx);
+                    @(posedge vif.pclk);
+                end while (tx.prdata[0] != 1'b0);
+
+                // 3. Read the fetched data from the RX FIFO (0x08)
+                tx = new(); tx.paddr = 32'h08; 
+                agt.send_read(tx);
+                val = tx.prdata;
+                
+                $display("   [DEBUG] Status Register Readback: %h (WIP = %b)", val, val[0]);
+                timeout_ctr++;
+            end
+        end
+    join_any 
+    
+    // Safety cleanup: Kill slave thread and release bus
+    disable fork; 
+    vif.D1 <= 1'bz; 
+
+    // =================================================================
+    // Evaluate and log the final outcome
+    // =================================================================
+    if (val[0] == 1'b0 && timeout_ctr > 0 && timeout_ctr < 50) begin
+        $display("[INFO] --- STEP 3: Evaluation ---");
+        $display("   [PASS] Flash READY. Sequence exited cleanly after %0d polls.\n", timeout_ctr);
+    end else begin
+        $display("[INFO] --- STEP 3: Evaluation ---");
+        $display("   [FAIL] Polling loop failed or timed out. Final Status Reg: %h, Polls: %0d\n", val, timeout_ctr);
+        test_pass = 1'b0;
     end
 
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Triggers the hardware to read the SPI Flash status register. 
-    // It loops and polls the returned data until the WIP bit (Bit 0) 
-    // is cleared, proving the APB master can handle software polling.
-    // =====================================================================
-    initial begin
-        logic [31:0] val = 32'h0000_0001; 
-        int timeout_ctr = 0;
-        
-        $dumpfile("dump_test_03.vcd"); $dumpvars(0, tb_test_03);
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-PHY-POL-03");
+    tb_top.scoreboard.mark_as_run("QSPI-PHY-POL-03");
 
-        // Keep polling via APB as long as the WIP bit is 1, up to 50 attempts
-        while (val[0] == 1'b1 && timeout_ctr < 50) begin
-            apb_write(32'h00, 32'h0000_0001); 
-            while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0)) @(posedge pclk);
-            apb_read(32'h08, val);
-            timeout_ctr++;
-        end
-
-        // Evaluate and log the final outcome
-        if (val[0] == 1'b0) begin
-            $display("   [PASS] Flash READY. Sequence exited cleanly.");
-            update_summary("tb_test_03", 1);
-        end else begin
-            $display("   [FAIL] Timed out waiting for ready.");
-            update_summary("tb_test_03", 0);
-        end
-        #100 $finish;
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
     end
-endmodule
+endtask

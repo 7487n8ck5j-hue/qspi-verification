@@ -1,151 +1,133 @@
-`timescale 1ns/1ps
-
 // =========================================================================
 // TEST 24: Custom Hardware Status Polling (QSPI-PHY-POL-24)
+// Comprehensive diagnostic verification of continuous status polling, 
+// utilizing TX-then-RX mode, strict CDC delays, and APB isolation.
 // =========================================================================
-module tb_test_24;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_24(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    logic [31:0] val = 32'h0000_0080;
+    int poll_ctr = 0;
+    int apb_timeout = 0;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 24: Custom Hardware Status Polling");
+    $display(" Target: QSPI-PHY-POL-24 | Validate continuous looping for device status");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // Pullups/weak highs are actively driven here on the Quad pins to 
-    // prevent the internal FSM from locking up on 'x' states during idle.
-    // =====================================================================
-    // Use weak highs to prevent 'X' state lockups in the FSM
-    assign D3 = 1'b1; assign D2 = 1'b1; assign D0 = 1'b1;
-    
-    reg slave_D1 = 1'b1; reg slave_oe = 0;
-    assign D1 = slave_oe ? slave_D1 : 1'b1;
-
-    qspi_apb_master dut (.*);
-    
-    // Generate a 100MHz clock (Toggles every 5ns)
-    always #5 pclk = ~pclk;
-
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write/read: Replicates a cycle-accurate AMBA APB protocol 
-    //   using a do-while loop to robustly wait for pready assertion.
-    // =====================================================================
-    // Standardized Makefile Tracking
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
-
-    // Robust AMBA Polling
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0;
-    endtask
-
-    task automatic apb_read(input [31:0] addr, output logic [31:0] data);
-        @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        data = prdata;
-        psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Mock SPI Flash Memory (The Slave)
-    // ---------------------------------------------------------------------
-    // Simulates a Flash device that is temporarily busy processing a command. 
-    // It cleanly waits out the 8-cycle command phase before driving the bus. 
-    // It returns a "Busy" status (Bit 7 = 1) for the first two polls, and 
-    // a "Ready" status (Bit 7 = 0) on the third attempt.
-    // =====================================================================
-    // Fixed Mock Flash: properly waits out the command phase before driving
-    initial begin
-        int poll_count = 0;
-        forever begin
-            @(negedge CS_n);
-            for (int i=0; i<8; i++) @(negedge CLK); // Skip command phase
-            
-            slave_oe = 1;
-            for (int i=7; i>=0; i--) begin 
-                @(negedge CLK); #1;
-                if (i == 7) slave_D1 = (poll_count < 2) ? 1'b1 : 1'b0;
-                else slave_D1 = 1'b0;
+    // We use fork..join_any to run the APB Master and a Custom Polling Flash Slave simultaneously.
+    fork
+        // ---------------------------------------------------------
+        // THREAD 1: Custom Polling Status Mock Slave
+        // ---------------------------------------------------------
+        begin : custom_polling_slave
+            int slave_poll_count = 0;
+            reg slave_D1_val = 1'b1;
+            forever begin
+                @(negedge vif.CS_n);
+                
+                // Skip the command phase (8 clock cycles for the 0x70 Opcode)
+                for (int i=0; i<8; i++) @(negedge vif.CLK);
+                
+                // Force D1 output enabled (Bit 7: 1 for first 2 polls, then 0 for Idle)
+                #1; vif.D1 <= (slave_poll_count < 2) ? 1'b1 : 1'b0;
+                
+                // Shift out the remaining 7 bits for the status byte
+                for (int i=6; i>=0; i--) begin
+                    @(negedge vif.CLK);
+                    #1;
+                    vif.D1 <= 1'b0; 
+                end
+                
+                slave_poll_count++;
+                @(posedge vif.CS_n);
+                #1;
+                vif.D1 <= 1'bz; // Drive High-Z
             end
-            poll_count++;
-            
-            @(posedge CS_n); #1; slave_oe = 0; slave_D1 = 1'b1;
         end
+
+        // ---------------------------------------------------------
+        // THREAD 2: QSPI Master Polling Sequence
+        // ---------------------------------------------------------
+        begin : master_apb_sequence
+            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+            repeat(5) @(posedge vif.pclk);
+
+            $display("[INFO] --- STEP 1: Configuring Master Architecture ---");
+            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; agt.send_write(tx); // Clock Divider
+            // FIX: Transfer Length to 15 (16 cycles: 8 for TX Opcode + 8 for RX Status)
+            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_000F; agt.send_write(tx); 
+
+            $display("[INFO] --- STEP 2: Executing Status Polling Loop ---");
+            while (val[7] == 1'b1 && poll_ctr < 50) begin
+                $display("   [DEBUG] Polling Iteration: %0d", poll_ctr + 1);
+                
+                // Write Opcode (0x70 = Read Status Register) to TX FIFO
+                tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'h7000_0000; agt.send_write(tx); 
+                
+                // FIX: Trigger TX-then-RX Mode (Bits 14:13=10 [TX/RX], Bit 0=1 [Start]) -> 0x4001
+                tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_4001; agt.send_write(tx); 
+                
+                // FIX: Proper CDC Delay & Polling Status Register (0x18) Bit 11
+                repeat(2) @(posedge vif.pclk);
+                apb_timeout = 0;
+                do begin
+                    tx = new(); tx.paddr = 32'h18; 
+                    agt.send_read(tx);
+                    @(posedge vif.pclk); 
+                    apb_timeout++;
+                end while (tx.prdata[11] == 1'b1 && apb_timeout < 1000);
+                
+                if (apb_timeout >= 1000) begin
+                    $display("   [FAIL] APB internal state machine timed out during poll!");
+                    test_pass = 1'b0;
+                    break;
+                end
+
+                // Read Status from RX FIFO (0x08)
+                tx = new(); tx.paddr = 32'h08; 
+                agt.send_read(tx);
+                val = tx.prdata;
+                
+                if (val[7] == 1'b1) begin
+                    $display("   [DEBUG] Status Register Bit 7 is HIGH (Busy). Re-issuing query...");
+                end else begin
+                    $display("   [PASS] Target hardware resolved block (Bit 7 LOW). Polling concluded properly.");
+                end
+                
+                poll_ctr++;
+            end
+        end
+    join_any
+    
+    // Safety cleanup: Kill background slave and release pins immediately
+    disable fork; 
+    vif.D1 <= 1'bz; 
+
+    // =================================================================
+    // Evaluate and log the final outcome
+    // =================================================================
+    $display("[INFO] --- STEP 3: Final Result Evaluation ---");
+    if (poll_ctr >= 50) begin
+        $display("   [FAIL] Hardware locked up. Polling limit (50) exceeded.");
+        test_pass = 1'b0;
+    end else if (apb_timeout >= 1000) begin
+        $display("   [FAIL] Sequence aborted due to APB timeout.");
+    end else begin
+        $display("   [PASS] Custom hardware status polling validated across %0d iterations.\n", poll_ctr);
     end
 
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates the hardware's capability to safely handle continuous 
-    // status polling without locking up. The test repeatedly queries the 
-    // device's status register (e.g., command 0x70) until the busy flag 
-    // clears, using timeout counters to prevent infinite simulation loops.
-    // =====================================================================
-    initial begin
-        logic [31:0] val = 32'h0000_0080;
-        int poll_ctr = 0;
-        int apb_timeout = 0;
-        
-        $dumpfile("dump_test_24.vcd"); $dumpvars(0, tb_test_24);
-        $display("\n=======================================================================");
-        $display(" TEST 24: Custom Hardware Status Polling");
-        $display(" Validate continuous looping for device status bit.");
-        $display("=======================================================================\n");
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-PHY-POL-24");
+    tb_top.scoreboard.mark_as_run("QSPI-PHY-POL-24");
 
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
-
-        while (val[7] == 1'b1 && poll_ctr < 50) begin
-            apb_write(32'h04, 32'h7000_0000); 
-            apb_write(32'h14, 32'h0000_0002); // Transfer Length: 2 bytes
-            apb_write(32'h00, 32'h0000_0001); // Start RX
-            
-            apb_timeout = 0;
-            while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0) && apb_timeout < 1000) begin
-                @(posedge pclk);
-                apb_timeout++;
-            end
-            
-            apb_read(32'h08, val);
-            if (val[7] == 1'b1) $display("   Status Register Bit 7 is HIGH (Busy). Re-issuing query...");
-            else $display("   [PASS] Target hardware resolved block. Polling concluded properly.\n");
-            
-            poll_ctr++;
-        end
-
-        if (poll_ctr >= 50) begin
-            $display("   [FAIL] Hardware locked up. Polling limit exceeded.");
-            update_summary("tb_test_24", 0);
-        end else if (apb_timeout >= 1000) begin
-            $display("   [FAIL] APB internal state machine timed out.");
-            update_summary("tb_test_24", 0);
-        end else begin
-            update_summary("tb_test_24", 1);
-        end
-
-        #100 $finish;
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
     end
-endmodule
+endtask

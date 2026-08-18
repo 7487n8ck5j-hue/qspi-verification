@@ -1,113 +1,103 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 04: Legacy SPI Mode FIFO Thresholds (TX)
+// TEST 04: Legacy SPI Mode FIFO Thresholds (TX) (QSPI-APB-LVL-04)
+// Comprehensive diagnostic verification of TX DMA threshold limits, 
+// FIFO population, and active hardware drain mechanics.
 // =========================================================================
-module tb_test_04;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_04(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 04: Legacy SPI Mode FIFO Thresholds (TX)");
+    $display(" Target: QSPI-APB-LVL-04 | TX DMA Threshold & Drain Verification");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // Pullups simulate physical board resistors, preventing data lines from
-    // floating to an unknown 'x' state when not actively driven.
-    // The (.*) syntax automatically connects wires to matching DUT ports.
-    // =====================================================================
-    pullup(D3); pullup(D2); pullup(D1); pullup(D0);
+    $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+    // Flush the FIFOs to remove ghost data left over from Test 01
+    // Write 1 to Bit 8 (Software Reset) -> 0x0100
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; 
+    agt.send_write(tx);
+    repeat(5) @(posedge vif.pclk);
+
+    $display("[INFO] --- STEP 1: Configuring Master Architecture ---");
+    // Set Clock Divider to 4
+    tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; 
+    agt.send_write(tx); 
     
-    qspi_apb_master dut (.*);
+    // FIX: Set Transfer Length Register (0x10) to 31 (0x1F).
+    // This equals 32 clock cycles (exactly 1 word). 
+    tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_001F; 
+    agt.send_write(tx);
+
+    $display("[INFO] --- STEP 2: Configuring DMA Control Register ---");
+    // Set TX DMA threshold to 2 and enable TX DMA (Bit 0) -> 0x0201
+    tx = new(); tx.paddr = 32'h28; tx.pwdata = 32'h0000_0201; 
+    agt.send_write(tx); 
     
-    // Generate a 100MHz clock (Toggles every 5ns)
-    always #5 pclk = ~pclk;
+    // Diagnostic Readback
+    tx = new(); tx.paddr = 32'h28; agt.send_read(tx);
+    $display("   [DEBUG] DMA Control Reg (0x28) Readback: %h", tx.prdata);
+    
+    $display("[INFO] --- STEP 3: Populating TX FIFO ---");
+    // Pre-fill the TX FIFO with EXACTLY 3 words. 
+    for (int i=0; i<3; i++) begin
+        tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'hA0A0_0000; 
+        agt.send_write(tx);
+    end
 
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write: Replicates a cycle-accurate AMBA APB write protocol.
-    // =====================================================================
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
+    // Allow a few cycles for APB-to-FIFO CDC logic to settle
+    repeat(3) @(posedge vif.pclk);
+    $display("   [DEBUG] Internal TX FIFO Count before transfer: %0d", tb_top.dut.tx_fifo_cnt);
+    
+    $display("[INFO] --- STEP 4: Negative Check (Pre-Drain) ---");
+    // Ensure the DMA request doesn't fire while FIFO > threshold (3 > 2)
+    if (vif.tx_dma_req === 1'b0) begin
+        $display("   [PASS] DMA Request correctly muted while FIFO (3) > Threshold (2).");
+    end else begin
+        $display("   [FAIL] DMA Request triggered too early! Expected LOW, got HIGH.");
+        test_pass = 1'b0;
+    end
 
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; wait(pready);
-        @(negedge pclk); psel=0; penable=0;
-    endtask
+    if (test_pass) begin
+        $display("[INFO] --- STEP 5: Triggering SPI Transmission ---");
+        // Trigger TX-Only Mode (Bit 13 = 1) + Start (Bit 0 = 1) -> 0x2001
+        // This forces the FSM to pop exactly 1 word from the FIFO, dropping the count to 2.
+        tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_2001; 
+        agt.send_write(tx);
 
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates the TX DMA Threshold functionality. It configures the DMA
-    // threshold, overfills the FIFO so the request shouldn't trigger yet,
-    // starts the SPI transmission, and ensures the DMA request asserts 
-    // exactly when the FIFO drains down to the programmed threshold limit.
-    // =====================================================================
-    initial begin
-        // Initialize waveform dumping and reset the hardware
-        $dumpfile("dump_test_04.vcd"); $dumpvars(0, tb_test_04);
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
-
-        // 1. Configure DMA Control Register (0x28). 
-        // Example: 0x0201 sets TX DMA threshold to 2 and enables TX DMA (Bit 0).
-        apb_write(32'h28, 32'h0000_0201); 
-        
-        // 2. Pre-fill the TX FIFO with 3 words (Above the threshold of 2)
-        for (int i=0; i<3; i++) begin
-            apb_write(32'h04, 32'hA0A0_0000);
-        end
-
-        #10;
-        
-        // 3. Negative Check: Ensure the DMA request doesn't fire while FIFO > threshold
-        if (tx_dma_req !== 1'b0) begin
-            $display("   [FAIL] Interrupt triggered too early.");
-            update_summary("tb_test_04", 0);
-            $finish;
-        end
-
-        // 4. Start the SPI transmission to begin draining the TX FIFO
-        apb_write(32'h00, 32'h0000_0003); // Start TX
-
-        // 5. Positive Check: Wait for the FIFO to drain and trigger the DMA request
+        $display("[INFO] --- STEP 6: Active Polling for FIFO Drain & DMA Request ---");
+        // Positive Check: Wait for the FIFO to drain and trigger the DMA request
         fork
-            begin
+            begin : check_request
                 // Monitor for the request assertion
-                wait(tx_dma_req == 1'b1);
-                $display("   [PASS] Level thresholds successfully triggered.");
-                update_summary("tb_test_04", 1);
+                wait(vif.tx_dma_req == 1'b1);
+                $display("   [DEBUG] Internal TX FIFO Count at DMA trigger: %0d", tb_top.dut.tx_fifo_cnt);
+                $display("   [PASS] TX DMA Level threshold successfully triggered as FIFO drained!");
             end
-            begin
-                // Safety timeout to prevent infinite simulation hangs
-                #2000;
-                $display("   [FAIL] Timeout: TX threshold request never triggered.");
-                update_summary("tb_test_04", 0);
+            begin : timeout_guard
+                // Safety timeout synced to the clock
+                repeat(500) @(posedge vif.pclk);
+                $display("   [DEBUG] Timeout reached. Final Internal TX FIFO Count: %0d", tb_top.dut.tx_fifo_cnt);
+                $display("   [DEBUG] RTL State Machine is stuck in STATE: %0d", tb_top.dut.state);
+                $display("   [FAIL] Timeout: TX threshold request never triggered. FSM stalled.");
+                test_pass = 1'b0;
             end
         join_any
         
         // Kill whichever branch didn't finish first
         disable fork;
-
-        #100 $finish;
     end
-endmodule
+
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-APB-LVL-04");
+    tb_top.scoreboard.mark_as_run("QSPI-APB-LVL-04");
+
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
+    end
+endtask

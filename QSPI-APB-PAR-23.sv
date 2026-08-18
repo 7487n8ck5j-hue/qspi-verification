@@ -1,107 +1,69 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 23: SRAM Partition Configuration
+// TEST 23: SRAM Partition Configuration (QSPI-APB-PAR-23)
+// Comprehensive validation of internal SRAM memory division, DMA threshold 
+// configurations, test isolation, and proper APB readback verification.
 // =========================================================================
-module tb_test_23;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_23(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 23: SRAM Partition Configuration (QSPI-APB-PAR-23)");
+    $display(" Target: Validate internal SRAM memory division & DMA bounds");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // In this SRAM partition test, the external flash bus is unused. All 
-    // data lines (D0-D3) are tied to high impedance ('z') as the focus 
-    // is entirely on internal DMA threshold and memory division logic.
-    // =====================================================================
-    assign D3 = 1'bz; assign D2 = 1'bz; assign D1 = 1'bz; assign D0 = 1'bz;
+    $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+    // Flush the FIFOs to ensure memory banks are truly empty for baseline testing
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+    repeat(5) @(posedge vif.pclk);
 
-    qspi_apb_master dut (.*);
+    $display("[INFO] --- STEP 1: Configuring SRAM Partition Thresholds ---");
+    // RX Threshold = 4 (Bits 23:16), TX Threshold = 4 (Bits 15:8), Enable Both (Bits 1:0) -> 0x0004_0403
+    tx = new(); tx.paddr = 32'h28; tx.pwdata = 32'h0004_0403; 
+    agt.send_write(tx); 
+
+    $display("[INFO] --- STEP 2: Verifying Configuration Readback ---");
+    // Diagnostic readback to prove the RTL latched the thresholds correctly
+    tx = new(); tx.paddr = 32'h28; agt.send_read(tx);
+    $display("   [DEBUG] DMA_CTRL (0x28) Readback: %h", tx.prdata);
     
-    // Generate a 100MHz clock (Toggles every 5ns)
-    always #5 pclk = ~pclk;
-
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write: Replicates a cycle-accurate AMBA APB write protocol 
-    //   using a do-while loop to robustly wait for pready assertion.
-    // =====================================================================
-    // Standardized Makefile Tracking
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
-
-    // Robust AMBA Polling
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates the internal SRAM memory division by configuring strict 
-    // threshold limits for the DMA controller. It verifies that the TX 
-    // boundary logic correctly requests data when empty, and the RX 
-    // boundary logic correctly suppresses read requests when empty.
-    // =====================================================================
-    initial begin
-        bit test_pass = 1'b1;
-        
-        $dumpfile("dump_test_23.vcd"); $dumpvars(0, tb_test_23);
-        $display("\n=======================================================================");
-        $display(" TEST 23: SRAM Partition Configuration (QSPI-APB-PAR-23)");
-        $display(" Validate internal SRAM memory division");
-        $display("=======================================================================\n");
-        
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
-
-        $display("1. Configuring strict SRAM partition thresholds (DMA_CTRL)...");
-        // RX Threshold = 4 (Bits 23:16), TX Threshold = 4 (Bits 15:8), Enable Both -> 0x0004_0403
-        apb_write(32'h28, 32'h0004_0403); 
-
-        $display("2. Verifying TX boundary logic response...");
-        #10;
-        if (tx_dma_req === 1'b1) begin
-            $display("   [PASS] TX Memory partition evaluated correctly (Empty queue requested data).");
-        end else begin
-            $display("   [FAIL] TX Memory partition evaluation failed.");
-            test_pass = 1'b0;
-        end
-
-        $display("3. Verifying RX boundary logic response...");
-        if (rx_dma_req === 1'b0) begin
-            $display("   [PASS] RX Memory partition evaluated correctly (Empty queue blocked read request).\n");
-        end else begin
-            $display("   [FAIL] RX Memory partition evaluation failed.\n");
-            test_pass = 1'b0;
-        end
-
-        // Log final unified result to Makefile
-        update_summary("tb_test_23", test_pass);
-        
-        #100 $finish;
+    if (tx.prdata === 32'h0004_0403) begin
+        $display("   [PASS] DMA threshold configuration correctly stored in APB registers.");
+    end else begin
+        $display("   [FAIL] DMA threshold configuration mismatch! Expected 0004_0403, Got: %h", tx.prdata);
+        test_pass = 1'b0;
     end
-endmodule
+
+    $display("[INFO] --- STEP 3: Verifying TX Boundary Logic Response ---");
+    repeat(2) @(posedge vif.pclk); // Wait for signals to propagate
+
+    $display("   [DEBUG] Physical TX_DMA_REQ Pin: %b", vif.tx_dma_req);
+    if (vif.tx_dma_req === 1'b1) begin
+        $display("   [PASS] TX Memory partition evaluated correctly (Empty queue asserted data request).");
+    end else begin
+        $display("   [FAIL] TX Memory partition evaluation failed (Pin did not assert).");
+        test_pass = 1'b0;
+    end
+
+    $display("[INFO] --- STEP 4: Verifying RX Boundary Logic Response ---");
+    $display("   [DEBUG] Physical RX_DMA_REQ Pin: %b", vif.rx_dma_req);
+    if (vif.rx_dma_req === 1'b0) begin
+        $display("   [PASS] RX Memory partition evaluated correctly (Empty queue blocked read request).\n");
+    end else begin
+        $display("   [FAIL] RX Memory partition evaluation failed (Pin erroneously asserted).\n");
+        test_pass = 1'b0;
+    end
+
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-APB-PAR-23");
+    tb_top.scoreboard.mark_as_run("QSPI-APB-PAR-23");
+
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
+    end
+endtask
