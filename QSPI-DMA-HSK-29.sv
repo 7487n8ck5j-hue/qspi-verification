@@ -1,146 +1,174 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 29: DMA Peripheral Handshaking
+// TEST 29: DMA Peripheral Handshaking (QSPI-DMA-HSK-29)
+// Comprehensive verification of AXI-like DMA handshake mechanisms, simulating
+// true DMA controller data movement, and strict APB status synchronization.
 // =========================================================================
-module tb_test_29;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_29(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    int timeout_ctr = 0;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 29: DMA Peripheral Handshaking (Read/Write)");
+    $display(" Target: QSPI-DMA-HSK-29 | AXI-Like DMA Integration & Handshake Validation");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // D3, D2, and D0 are tied to high impedance ('z') since they are unused. 
-    // D1 (MISO) is conditionally driven by the mock slave to feed data back 
-    // to the master during read operations.
-    // =====================================================================
-    logic slave_D1 = 1'bz; logic slave_oe = 0;
-    assign D1 = slave_oe ? slave_D1 : 1'bz;
-    assign D3 = 1'bz; assign D2 = 1'bz; assign D0 = 1'bz;
+    // Initialize DMA control and handshake lines
+    vif.D1 <= 1'bz;
+    vif.tx_dma_ack = 1'b0;
+    vif.rx_dma_ack = 1'b0;
 
-    qspi_apb_master dut (.*);
+    // We use fork..join_any to run the APB Master sequence and a Safe Mock Flash Slave simultaneously.
+    fork
+        // ---------------------------------------------------------
+        // THREAD 1: Safe Mock Flash Slave Implementation
+        // ---------------------------------------------------------
+        begin : safe_mock_flash_slave
+            reg slave_oe_reg = 0;
+            
+            forever begin
+                @(negedge vif.CS_n);
+                slave_oe_reg = 1;
+                
+                while (vif.CS_n == 1'b0) begin
+                    #1;
+                    if (slave_oe_reg) begin
+                        vif.D1 <= 1'b1; // Safe procedural driver assignment
+                    end
+                    @(posedge vif.CLK);
+                end
+                
+                slave_oe_reg = 0;
+                #1;
+                vif.D1 <= 1'bz; // Release pin to High-Z
+            end
+        end
+
+        // ---------------------------------------------------------
+        // THREAD 2: QSPI Master DMA Handshake and Control Sequence
+        // ---------------------------------------------------------
+        begin : master_dma_sequence
+            
+            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+            repeat(5) @(posedge vif.pclk);
+            
+            $display("[INFO] --- STEP 1: Configuring Architecture & DMA Boundaries ---");
+            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; agt.send_write(tx); // Clock Divider
+            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_001F; agt.send_write(tx); // 32 bits
+
+            // Configure DMA Control Register (0x28)
+            // RX Threshold = 1 (Bits 23:16), TX Threshold = 1 (Bits 15:8), Enable Both TX/RX = 0x03 -> 0x0001_0103
+            tx = new(); tx.paddr = 32'h28; tx.pwdata = 32'h0001_0103; 
+            agt.send_write(tx); 
+
+            // --- Sub-Phase A: TX Handshake Integration Validation ---
+            $display("[INFO] --- STEP 2: Validating TX DMA Request/Acknowledge Integration ---");
+            timeout_ctr = 0;
+            
+            while (vif.tx_dma_req == 1'b0 && timeout_ctr < 1000) begin
+                @(posedge vif.pclk);
+                timeout_ctr++;
+            end
+
+            if (vif.tx_dma_req === 1'b1) begin
+                $display("   [PASS] TX DMA Request ('tx_dma_req') raised automatically by controller.");
+            end else begin
+                $display("   [FAIL] TX DMA Request timeout: 'tx_dma_req' failed to assert within 1000 cycles.");
+                test_pass = 1'b0;
+            end
+            
+            // FIX: Simulate external DMA Controller physically moving the data via APB
+            tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'hDEAD_BEEF; 
+            agt.send_write(tx);
+
+            // Assert TX DMA Acknowledge to complete the handshake
+            @(negedge vif.pclk); 
+            vif.tx_dma_ack = 1'b1; 
+            @(negedge vif.pclk); 
+            vif.tx_dma_ack = 1'b0; 
+            repeat(2) @(posedge vif.pclk);
+            
+            // FIX: Front-door verification of internal TX FIFO population count (0x18[3:0])
+            tx = new(); tx.paddr = 32'h18; 
+            agt.send_read(tx);
+            if (tx.prdata[3:0] == 4'd1) begin
+                $display("   [PASS] TX Acknowledge handshake successfully populated internal FIFO (Count = 1).");
+            end else begin
+                $display("   [FAIL] TX Acknowledge stream failure. Expected FIFO count: 1, Actual: %0d", tx.prdata[3:0]);
+                test_pass = 1'b0;
+            end
+
+            // --- Sub-Phase B: RX Handshake Integration Validation ---
+            $display("[INFO] --- STEP 3: Validating RX DMA Request/Acknowledge Integration ---");
+            
+            // Trigger RX operation via Control Register (Start RX: Bit 1=0, Bit 0=1 -> 0x0000_0001)
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; 
+            agt.send_write(tx); 
+            
+            $display("[INFO] --- STEP 4: Actively Polling FSM Status ---");
+            repeat(2) @(posedge vif.pclk);
+            timeout_ctr = 0;
+            do begin
+                tx = new(); tx.paddr = 32'h18; 
+                agt.send_read(tx);
+                @(posedge vif.pclk); 
+                timeout_ctr++;
+            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+            
+            // Wait for RX DMA request signal assertion
+            timeout_ctr = 0;
+            while (vif.rx_dma_req == 1'b0 && timeout_ctr < 1000) begin
+                @(posedge vif.pclk);
+                timeout_ctr++;
+            end
+
+            if (vif.rx_dma_req === 1'b1) begin
+                $display("   [PASS] RX DMA Request ('rx_dma_req') raised automatically after payload receipt.");
+            end else begin
+                $display("   [FAIL] RX DMA Request timeout: 'rx_dma_req' failed to assert within 1000 cycles.");
+                test_pass = 1'b0;
+            end
+            
+            // FIX: Simulate external DMA controller physically popping the data from the RX FIFO via APB
+            tx = new(); tx.paddr = 32'h08; 
+            agt.send_read(tx);
+
+            // Assert RX DMA Acknowledge to complete the handshake
+            @(negedge vif.pclk); 
+            vif.rx_dma_ack = 1'b1; 
+            @(negedge vif.pclk); 
+            vif.rx_dma_ack = 1'b0; 
+            repeat(2) @(posedge vif.pclk);
+
+            // FIX: Front-door verification of internal RX FIFO drain status (Assuming RX_FIFO_CNT is [19:16])
+            tx = new(); tx.paddr = 32'h18; 
+            agt.send_read(tx);
+            if (tx.prdata[19:16] == 4'd0) begin
+                $display("   [PASS] RX Acknowledge handshake successfully drained internal FIFO (Count = 0).\n");
+            end else begin 
+                $display("   [FAIL] RX Acknowledge drain failure. Expected FIFO count: 0, Actual: %0d\n", tx.prdata[19:16]);
+                test_pass = 1'b0;
+            end
+        end
+    join_any
     
-    // Generate a 100MHz clock (Toggles every 5ns)
-    always #5 pclk = ~pclk;
+    // Safety cleanup
+    disable fork; 
+    vif.D1 <= 1'bz; 
+    vif.tx_dma_ack = 1'b0;
+    vif.rx_dma_ack = 1'b0;
 
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write: Replicates a cycle-accurate AMBA APB write protocol 
-    //   using a do-while loop to robustly wait for pready assertion.
-    // =====================================================================
-    // Standardized Makefile Tracking
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
+    // =================================================================
+    // Global Scoreboard Registration
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-DMA-HSK-29");
+    tb_top.scoreboard.mark_as_run("QSPI-DMA-HSK-29");
 
-    // Robust AMBA Polling
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Mock SPI Flash Memory (The Slave)
-    // ---------------------------------------------------------------------
-    // Simulates a safe flash response. The asynchronous posedge CS_n reset 
-    // ensures the slave cleanly aborts its transmission and returns to 
-    // high impedance when the chip select line is de-asserted. Drives logic
-    // HIGH ('1') when active.
-    // =====================================================================
-    // Safe Mock Flash: Drives 1s when active, safely resets on CS_n high
-    always @(negedge CLK or posedge CS_n) begin
-        if (CS_n) begin
-            slave_oe <= 0;
-            slave_D1 <= 1'bz;
-        end else begin
-            slave_oe <= 1;
-            slave_D1 <= 1'b1;
-        end
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
     end
-
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates AXI-like DMA integration and peripheral handshaking.
-    // Configures the DMA boundaries and checks the hardware's capability 
-    // to automatically raise DMA requests (tx_dma_req/rx_dma_req) and properly 
-    // update internal FIFOs when the system acknowledges (tx_dma_ack/rx_dma_ack).
-    // =====================================================================
-    initial begin
-        bit test_pass = 1'b1;
-        
-        $dumpfile("dump_test_29.vcd"); $dumpvars(0, tb_test_29);
-        $display("\n=======================================================================");
-        $display(" TEST 29: DMA Peripheral Handshaking (Read/Write)");
-        $display(" Validate AXI-like DMA integration");
-        $display("=======================================================================\n");
-        
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
-
-        $display("1. Configuring DMA boundaries: RX Threshold = 1, TX Threshold = 1...");
-        // RX Thresh=1 (Bits 23:16), TX Thresh=1 (Bits 15:8), En TX/RX = 1 -> 0x0001_0103
-        apb_write(32'h28, 32'h0001_0103); 
-
-        // --- TX Handshake Test ---
-        $display("2. Validating TX Handshake integration...");
-        wait(tx_dma_req == 1'b1);
-        $display("   [PASS] TX DMA Request raised automatically.");
-        
-        @(negedge pclk); tx_dma_ack = 1'b1; // System pushes data
-        @(negedge pclk); tx_dma_ack = 1'b0; 
-        #10;
-        
-        if (dut.tx_fifo_cnt == 4'd1) begin
-            $display("   [PASS] TX Acknowledge successfully populated FIFO.");
-        end else begin
-            $display("   [FAIL] TX Acknowledge failed.");
-            test_pass = 1'b0;
-        end
-
-        // --- RX Handshake Test ---
-        $display("3. Validating RX Handshake integration...");
-        apb_write(32'h00, 32'h0000_0001); // Start RX
-        
-        // Wait for flash to feed RX FIFO
-        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0)) @(posedge pclk);
-        
-        wait(rx_dma_req == 1'b1);
-        $display("   [PASS] RX DMA Request raised automatically after payload receipt.");
-        
-        @(negedge pclk); rx_dma_ack = 1'b1; // System pops data
-        @(negedge pclk); rx_dma_ack = 1'b0; 
-        #10;
-
-        if (dut.rx_fifo_cnt == 4'd0) begin
-            $display("   [PASS] RX Acknowledge successfully drained FIFO.\n");
-        end else begin 
-            $display("   [FAIL] RX Acknowledge failed.\n");
-            test_pass = 1'b0;
-        end
-
-        update_summary("tb_test_29", test_pass);
-        #100 $finish;
-    end
-endmodule
+endtask

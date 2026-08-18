@@ -1,105 +1,76 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 39: SRAM Overrun / Back-Pressure Handling
+// TEST 39: SRAM Overrun / Back-Pressure Handling (QSPI-IND-LVL-39)
+// Comprehensive verification of FIFO overrun protection, proving the hardware
+// throttles data at maximum capacity using Split-Register APB polling.
 // =========================================================================
-module tb_test_39;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_39(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    logic [3:0] fifo_cnt;
+    logic       tx_full_flag;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 39: SRAM Overrun / Back-Pressure Handling (QSPI-IND-LVL-39)");
+    $display(" Target: Validate hardware queue throttling and TX_FULL flag assertion");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // Pullups simulate physical board resistors. No mock slave is needed 
-    // for this test as the focus is entirely on the internal SRAM FIFO 
-    // boundary management and full-flag assertion.
-    // =====================================================================
-    pullup(D3); pullup(D2); pullup(D1); pullup(D0);
-    qspi_apb_master dut (.*);
+    $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+    // Flush previous states to guarantee an absolutely empty FIFO baseline
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+    repeat(5) @(posedge vif.pclk);
 
-    // Generate a 100MHz clock (Toggles every 5ns)
-    always #5 pclk = ~pclk;
+    $display("[INFO] --- STEP 1: Waking Up Internal Clock Domain ---");
+    // Configure the clock divider (0x0C) to un-gate the internal SPI clock 
+    // so the async FIFO synchronizers can evaluate the boundary flags.
+    tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; agt.send_write(tx);
+    repeat(2) @(posedge vif.pclk);
 
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write/read: Replicates a cycle-accurate AMBA APB protocol 
-    //   using a do-while loop to robustly wait for pready assertion.
-    // =====================================================================
-    // Standardized Makefile Tracking
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
-
-    // Robust AMBA Polling
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0;
-    endtask
-
-    task automatic apb_read(input [31:0] addr, output logic [31:0] data);
-        @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        data = prdata;
-        psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates SRAM overrun and back-pressure handling (QSPI-IND-LVL-39).
-    // It intentionally pushes 10 words into an 8-word deep TX FIFO. The 
-    // test passes if the hardware clamps the queue size at 8 and correctly 
-    // asserts the TX_Full flag in the status/control register.
-    // =====================================================================
-    initial begin
-        logic [31:0] val;
-        bit test_pass = 1'b1;
-
-        $dumpfile("dump_test_39.vcd"); $dumpvars(0, tb_test_39);
-        $display("\n=======================================================================");
-        $display(" TEST 39: SRAM Overrun / Back-Pressure Handling (QSPI-IND-LVL-39)");
-        $display("=======================================================================\n");
-        
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
-
-        $display("1. Pushing 10 words into the 8-word TX FIFO...");
-        for (int i=0; i<10; i++) begin
-            apb_write(32'h04, 32'hA1A1_A1A1); 
-        end
-
-        apb_read(32'h00, val);
-
-        if (dut.tx_fifo_cnt == 4'd8 && val[5] == 1'b1) begin
-            $display("   [PASS] Hardware throttled queue at 8. TX_Full flag successfully asserted.\n");
-        end else begin
-            $display("   [FAIL] Hardware failed to clamp queue size. (Count: %0d, TX_Full: %b)\n", dut.tx_fifo_cnt, val[5]);
-            test_pass = 1'b0;
-        end
-
-        update_summary("tb_test_39", test_pass);
-        #100 $finish;
+    $display("[INFO] --- STEP 2: Pushing 10 words into the 8-word TX FIFO ---");
+    // Intentionally overload the queue by writing to TX Register (0x04)
+    for (int i = 0; i < 10; i++) begin
+        tx = new(); 
+        tx.paddr = 32'h04; 
+        tx.pwdata = 32'hA1A1_A1A1; 
+        agt.send_write(tx);
     end
-endmodule
+
+    // Allow the async FIFO gray-code pointers to synchronize across clock domains
+    repeat(10) @(posedge vif.pclk);
+
+    $display("[INFO] --- STEP 3: Validating Split-Register Hardware Back-Pressure ---");
+    
+    // 1. Read the Diagnostic Status Register (0x18) for the physical count
+    tx = new(); tx.paddr = 32'h18; agt.send_read(tx);
+    fifo_cnt = tx.prdata[3:0];
+    
+    // 2. Read the Control/Interrupt Register (0x00) for the TX_FULL flag
+    tx = new(); tx.paddr = 32'h00; agt.send_read(tx);
+    tx_full_flag = tx.prdata[5];
+    
+    $display("   [DEBUG] Diagnostic Reg (0x18) TX_FIFO_CNT : %0d", fifo_cnt);
+    $display("   [DEBUG] Control Reg (0x00) TX_FIFO_FULL   : %b", tx_full_flag);
+
+    // =================================================================
+    // Evaluate and log the final outcome
+    // =================================================================
+    $display("[INFO] --- STEP 4: Final Result Evaluation ---");
+    if (fifo_cnt == 4'd8 && tx_full_flag === 1'b1) begin
+        $display("   [PASS] Hardware throttled queue perfectly at 8 words. TX_FULL flag successfully asserted.\n");
+    end else begin
+        $display("   [FAIL] Hardware failed to clamp queue size! (Count: %0d, TX_Full: %b)\n", fifo_cnt, tx_full_flag);
+        test_pass = 1'b0;
+    end
+
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-IND-LVL-39");
+    tb_top.scoreboard.mark_as_run("QSPI-IND-LVL-39");
+
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
+    end
+endtask

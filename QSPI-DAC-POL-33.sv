@@ -1,143 +1,121 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 33: Auto-Polling after DAC Write
+// TEST 33: Auto-Polling after DAC Write (QSPI-DAC-POL-33)
+// Comprehensive verification of autonomous write-in-progress (WIP) status 
+// polling cycles, proper reset isolation, and APB status synchronization.
 // =========================================================================
-module tb_test_33;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_33(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    int timeout_ctr = 0;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 33: Auto-Polling after DAC Write");
+    $display(" Target: QSPI-DAC-POL-33 | Automated Write Cycle & Status Tracking");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // D3, D2, and D0 are tied to high impedance ('z') since they are unused
-    // during the read phase of the polling. D1 (MISO) is conditionally 
-    // driven by the mock slave to feed the status register data back.
-    // =====================================================================
-    logic slave_D1 = 1'bz; logic slave_oe = 0;
-    assign D1 = slave_oe ? slave_D1 : 1'bz;
-    assign D3 = 1'bz; assign D2 = 1'bz; assign D0 = 1'bz;
+    // Initialize data lines to a safe state
+    vif.D1 <= 1'bz;
 
-    qspi_apb_master dut (.*);
-    
-    // Generate a 100MHz clock (Toggles every 5ns)
-    always #5 pclk = ~pclk;
+    // We use fork..join_any to run the APB Master and a Custom Auto-Poll Flash Slave simultaneously.
+    fork
+        // ---------------------------------------------------------
+        // THREAD 1: Simulated Auto-Poll Response Slave Implementation
+        // ---------------------------------------------------------
+        begin : custom_auto_poll_slave
+            logic [7:0] cmd;
+            int poll_count = 0;
+            reg slave_D1_val = 1'b0;
+            reg slave_oe_reg = 0;
 
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write: Replicates a cycle-accurate AMBA APB write protocol 
-    //   using a do-while loop to robustly wait for pready assertion.
-    // =====================================================================
-    // Standardized Makefile Tracking
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
-
-    // Robust AMBA Polling
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Mock SPI Flash Memory (The Slave)
-    // ---------------------------------------------------------------------
-    // Simulates a Flash device processing an automated status poll. It reads 
-    // the incoming 8-bit command on D0. If it receives a Read Status 
-    // Register command (0x05), it responds on D1 with a Write-In-Progress 
-    // (WIP) bit (Bit 0) set to HIGH for the first two reads, and then 
-    // clears it to LOW on the third read to simulate the write completing.
-    // =====================================================================
-    // Simulated Auto-Poll Response
-    initial begin
-        logic [7:0] cmd;
-        int poll_count = 0;
-        forever begin
-            @(negedge CS_n);
-            for (int i=7; i>=0; i--) begin 
-                @(posedge CLK); 
-                cmd[i] = (D0 === 1'bz) ? 1'b0 : D0; 
-            end
-            
-            if (cmd == 8'h05) begin // Read Status Register
-                slave_oe = 1;
-                for (int i=7; i>=0; i--) begin 
-                    @(negedge CLK); 
-                    if (i == 0) slave_D1 = (poll_count < 2) ? 1'b1 : 1'b0; // Busy drops after 2 polls
-                    else slave_D1 = 1'b0;
+            forever begin
+                @(negedge vif.CS_n);
+                #1; // Delta-cycle safety margin
+                
+                // Sample 8 incoming command bits on D0
+                for (int i = 7; i >= 0; i--) begin 
+                    @(posedge vif.CLK); 
+                    cmd[i] = (vif.D0 === 1'bz) ? 1'b0 : vif.D0; 
                 end
-                poll_count++;
+                
+                if (cmd == 8'h05) begin // Read Status Register command
+                    slave_oe_reg = 1;
+                    for (int i = 7; i >= 0; i--) begin 
+                        @(negedge vif.CLK); 
+                        #1;
+                        if (i == 0) slave_D1_val = (poll_count < 2) ? 1'b1 : 1'b0; // Busy bit (D1) drops after 2 polls
+                        else slave_D1_val = 1'b0;
+                        
+                        vif.D1 <= slave_D1_val; // Safe procedural non-blocking driver update
+                    end
+                    poll_count++;
+                end
+                
+                @(posedge vif.CS_n); 
+                slave_oe_reg = 0;
+                #1;
+                vif.D1 <= 1'bz; // Return pin control to high-impedance state
             end
-            @(posedge CS_n); 
-            slave_oe = 0;
         end
+
+        // ---------------------------------------------------------
+        // THREAD 2: QSPI Master APB Sequence
+        // ---------------------------------------------------------
+        begin : master_apb_sequence
+            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+            // FIX: Issue Software Reset to clear previous test states and prevent PSLVERR
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+            repeat(5) @(posedge vif.pclk);
+
+            $display("[INFO] --- STEP 1: Activating DAC Write Configuration ---");
+            tx = new(); tx.paddr = 32'h20; tx.pwdata = 32'h0000_0001; 
+            agt.send_write(tx); 
+
+            $display("[INFO] --- STEP 2: Executing DAC Write Transaction ---");
+            tx = new(); tx.paddr = 32'h1000_0000; tx.pwdata = 32'hCAFE_BABE; 
+            agt.send_write(tx); 
+
+            $display("[INFO] --- STEP 3: Actively Polling Hardware WIP Tracking Phase ---");
+            // FIX: Proper CDC Delay & Polling Status Register (0x18) Bit 11
+            repeat(2) @(posedge vif.pclk);
+            timeout_ctr = 0;
+            do begin
+                tx = new(); tx.paddr = 32'h18; 
+                agt.send_read(tx);
+                @(posedge vif.pclk); 
+                timeout_ctr++;
+            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 5000);
+            
+            $display("   [DEBUG] Auto-polling resolved after %0d APB clock cycles.", timeout_ctr);
+        end
+    join_any
+    
+    // Safety cleanup: Terminate background threads and release pin immediately to High-Z
+    disable fork; 
+    vif.D1 <= 1'bz; 
+
+    repeat(5) @(posedge vif.pclk);
+
+    // =================================================================
+    // Result Evaluation & Data Integrity Verification
+    // =================================================================
+    $display("[INFO] --- STEP 4: Final Result Evaluation ---");
+    if (timeout_ctr >= 5000) begin
+        $display("   [FAIL] Hardware timed out or locked up during polling phase (Timeout >= 5000 cycles).\n");
+        test_pass = 1'b0;
+    end else begin
+        $display("   [PASS] Hardware auto-polling sequence verified. Write cycle resolved cleanly.\n");
     end
 
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates the Direct Access Controller's (DAC) hardware auto-polling 
-    // feature. It executes a memory-mapped write operation (0x1000_0000) 
-    // and then monitors the FSM to ensure it autonomously transitions into 
-    // a polling loop, repeatedly fetching the status register until the 
-    // mock slave indicates the internal write cycle is complete.
-    // =====================================================================
-    initial begin
-        int timeout_ctr = 0;
-        $dumpfile("dump_test_33.vcd"); $dumpvars(0, tb_test_33);
-        $display("\n=======================================================================");
-        $display(" TEST 33: Auto-Polling after DAC Write");
-        $display(" Validate automated write cycle tracking");
-        $display("=======================================================================\n");
-        
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
+    // =================================================================
+    // Global Scoreboard Registration
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-DAC-POL-33");
+    tb_top.scoreboard.mark_as_run("QSPI-DAC-POL-33");
 
-        $display("1. Activating DAC Write configuration...");
-        apb_write(32'h20, 32'h0000_0001); 
-
-        $display("2. Executing DAC Write at 0x1000_0000...");
-        apb_write(32'h1000_0000, 32'hCAFE_BABE); 
-
-        $display("3. Monitoring hardware for autonomous WIP tracking phase...");
-        
-        // Wait for FSM to naturally execute write -> poll -> poll -> finish
-        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0) && timeout_ctr < 5000) begin
-            @(posedge pclk);
-            timeout_ctr++;
-        end
-
-        #20;
-
-        if (timeout_ctr < 5000) begin
-            $display("   [PASS] Hardware auto-polling sequence verified. Write cycle resolved cleanly.\n");
-            update_summary("tb_test_33", 1);
-        end else begin
-            $display("   [FAIL] Hardware timed out or locked up during polling phase.\n");
-            update_summary("tb_test_33", 0);
-        end
-
-        #100 $finish;
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
     end
-endmodule
+endtask

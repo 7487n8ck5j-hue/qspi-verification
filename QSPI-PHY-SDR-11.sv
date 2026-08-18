@@ -1,107 +1,116 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 11: External DLL Loopback
+// TEST 11: External DLL Loopback (QSPI-PHY-SDR-11)
+// Comprehensive validation of TX-then-RX mode, sequential half-duplex 
+// loopback buffering, and strict CDC-aware APB polling.
 // =========================================================================
-module tb_test_11;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_11(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    logic [31:0] val; 
+    int timeout_ctr = 0;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 11: External DLL Loopback (QSPI-PHY-SDR-11)");
+    $display(" Target: Validate half-duplex sequential data sampling loopback.");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // Simulates an external board-level loopback test. The MOSI pin (D0) 
-    // is physically tied directly to the MISO pin (D1) so that whatever 
-    // the master transmits is immediately fed back into its own receiver.
-    // =====================================================================
-    // Simulate External Loopback (MOSI tied directly to MISO)
-    assign D1 = D0; 
-    assign D3 = 1'bz; assign D2 = 1'bz;
-
-    qspi_apb_master dut (.*);
-    always #5 pclk = ~pclk;
-
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write/read: Replicates a cycle-accurate AMBA APB protocol 
-    //   using a do-while loop to wait for pready assertion.
-    // =====================================================================
-    // Standardized Makefile Tracking
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
+    // We use fork..join_any to run the APB Master and the hardware loopback simultaneously.
+    fork
+        // ---------------------------------------------------------
+        // THREAD 1: Sequential Hardware Loopback Buffer
+        // ---------------------------------------------------------
+        begin : external_loopback_buffer
+            reg [31:0] loopback_reg;
+            forever begin
+                @(negedge vif.CS_n);
+                
+                // PHASE 1: Record Master's TX Data (32 cycles)
+                for (int i=0; i<32; i++) begin
+                    @(posedge vif.CLK);
+                    loopback_reg = {loopback_reg[30:0], vif.D0};
+                end
+                
+                // PHASE 2: Playback Data to Master's RX Phase (32 cycles)
+                // Wait for the master to transition from ST_TX to ST_RX
+                @(negedge vif.CLK);
+                for (int i=0; i<32; i++) begin
+                    #1 vif.D1 <= loopback_reg[31]; // Drive data on negedge for master to sample on posedge
+                    loopback_reg = {loopback_reg[30:0], 1'b0};
+                    if (i < 31) @(negedge vif.CLK);
+                end
+                
+                @(posedge vif.CS_n);
+                #1 vif.D1 <= 1'bz;
+            end
         end
-    endtask
 
-    // Robust AMBA Polling
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0;
-    endtask
+        // ---------------------------------------------------------
+        // THREAD 2: QSPI Master Sequence
+        // ---------------------------------------------------------
+        begin : master_apb_sequence
+            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+            repeat(5) @(posedge vif.pclk);
 
-    // Robust AMBA Polling
-    task automatic apb_read(input [31:0] addr, output logic [31:0] data);
-        @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        data = prdata;
-        psel=0; penable=0;
-    endtask
+            $display("[INFO] --- STEP 1: Configuring Master Architecture ---");
+            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; agt.send_write(tx); // Clock Divider
+            // FIX: Set Transfer Length to 31 (32 cycles) for BOTH the TX and RX phases
+            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_001F; agt.send_write(tx);
 
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates the DLL and transceiver path by transmitting a known payload 
-    // out of the TX pin (D0) and relying on the hardwired loopback to 
-    // push the data directly back into the RX pin (D1) to be sampled.
-    // =====================================================================
-    initial begin
-        logic [31:0] val;
-        
-        $dumpfile("dump_test_11.vcd"); $dumpvars(0, tb_test_11);
-        $display("\n=======================================================================");
-        $display(" TEST 11: External DLL Loopback (QSPI-PHY-SDR-11)");
-        $display(" Validate data sampling using an external loopback clock.");
-        $display("=======================================================================\n");
-        
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
+            $display("[INFO] --- STEP 2: Loading Loopback Payload ---");
+            tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'h5A5A_C3C3; agt.send_write(tx); 
 
-        $display("1. Loading specific payload to TX FIFO for loopback test...");
-        apb_write(32'h04, 32'h5A5A_C3C3); 
+            $display("[INFO] --- STEP 3: Triggering TX-then-RX Mode ---");
+            // FIX: Trigger TX-then-RX Mode (Bits 14:13 = 2'b10 -> 0x4000) + Start (Bit 0 = 1) = 0x4001
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_4001; agt.send_write(tx); 
+            
+            // FIX: Proper CDC Delay & Polling Status Register (0x18) Bit 11
+            repeat(2) @(posedge vif.pclk);
+            timeout_ctr = 0;
+            do begin
+                tx = new(); tx.paddr = 32'h18; 
+                agt.send_read(tx);
+                @(posedge vif.pclk); 
+                timeout_ctr++;
+            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+            
+            $display("   [DEBUG] FSM returned to IDLE after %0d APB clock cycles.", timeout_ctr);
 
-        $display("2. Triggering Transceiver in Loopback Mode...");
-        // Start (Bit 0) = 1, TX (Bit 1) = 1
-        apb_write(32'h00, 32'h0000_0003); 
-        
-        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0)) @(posedge pclk);
-        #10;
+            $display("[INFO] --- STEP 4: Fetching captured data from RX FIFO ---");
+            tx = new(); tx.paddr = 32'h08; 
+            agt.send_read(tx);
+            val = tx.prdata;
+        end
+    join_any
+    
+    // Safety cleanup: Kill background loopback and release the pin immediately
+    disable fork; 
+    vif.D1 <= 1'bz;
 
-        $display("3. Fetching captured data from RX FIFO...");
-        apb_read(32'h08, val);
-
-        $display("   [PASS] Loopback sampling verified cleanly without phase drift.\n");
-        update_summary("tb_test_11", 1);
-        
-        #100 $finish;
+    // =================================================================
+    // Evaluate and log the final outcome
+    // =================================================================
+    $display("[INFO] --- STEP 5: Final Result Evaluation ---");
+    if (timeout_ctr >= 1000) begin
+        $display("   [FAIL] Hardware locked up during loopback test.\n");
+        test_pass = 1'b0;
+    end else if (val === 32'h5A5A_C3C3) begin
+        $display("   [PASS] Loopback sampling verified cleanly without phase drift. Data: %h\n", val);
+    end else begin
+        $display("   [FAIL] Loopback data mismatch. Expected: 5A5AC3C3, Got: %h\n", val);
+        test_pass = 1'b0;
     end
-endmodule
+
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-PHY-SDR-11");
+    tb_top.scoreboard.mark_as_run("QSPI-PHY-SDR-11");
+
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
+    end
+endtask

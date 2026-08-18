@@ -1,145 +1,122 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 22: Dummy Clock Cycle Generation
+// TEST 22: Dummy Clock Cycle Generation (Quad Mode) (QSPI-PHY-DUM-22)
+// Comprehensive diagnostic verification of programmable dummy wait states,
+// RX-Only Quad mode extraction, and strict CDC-aware APB polling.
 // =========================================================================
-module tb_test_22;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_22(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    logic [31:0] val; 
+    int timeout_ctr = 0;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 22: Dummy Clock Cycle Generation (Quad Mode)");
+    $display(" Target: QSPI-PHY-DUM-22 | Validate programmable dummy wait states");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // Pullups simulate physical board resistors, preventing data lines from
-    // floating to an unknown 'x' state when the bus is idle.
-    // =====================================================================
-    pullup(D3); pullup(D2); pullup(D1); pullup(D0);
-
-    logic [3:0] slave_drv = 4'hz; 
-    logic slave_oe = 0;
-    assign D3 = slave_oe ? slave_drv[3] : 1'bz;
-    assign D2 = slave_oe ? slave_drv[2] : 1'bz;
-    assign D1 = slave_oe ? slave_drv[1] : 1'bz;
-    assign D0 = slave_oe ? slave_drv[0] : 1'bz;
-
-    qspi_apb_master dut (.*);
-    
-    // Generate a 100MHz clock (Toggles every 5ns)
-    always #5 pclk = ~pclk;
-
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write/read: Replicates a cycle-accurate AMBA APB protocol 
-    //   using a do-while loop to robustly wait for pready assertion.
-    // =====================================================================
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
-
-    task automatic apb_write(input [31:0] addr, input [31:0] data, input [3:0] strb = 4'b1111);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=strb;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0; pstrb=4'b1111;
-    endtask
-
-    task automatic apb_read(input [31:0] addr, output logic [31:0] data);
-        @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        data = prdata;
-        psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Mock SPI Flash Memory (The Slave)
-    // ---------------------------------------------------------------------
-    // Simulates a Flash memory device responding to a read command with 
-    // dummy cycles. The slave waits for the programmed number of dummy 
-    // clock edges before actively driving the payload (0xDEAD_BEEF) onto 
-    // the Quad data bus.
-    // =====================================================================
-    initial begin
-        reg [31:0] payload;
-        forever begin
-            @(negedge CS_n);
-            
-            // RTL counts the initial state as cycle 1, so 6 programmed = 5 physical edges
-            repeat(5) @(negedge CLK); 
-            
-            slave_oe = 1;
-            payload = 32'hDEAD_BEEF;
-            
-            for (int i=7; i>=0; i--) begin 
-                slave_drv = (payload >> (i*4)) & 4'hF; 
-                if (i > 0) @(negedge CLK); 
+    // We use fork..join_any to run the APB Master and a Custom Quad-SPI Slave simultaneously.
+    fork
+        // ---------------------------------------------------------
+        // THREAD 1: Custom Quad-SPI Mock Slave (Respecting 6 Dummy Cycles)
+        // ---------------------------------------------------------
+        begin : custom_quad_dummy_slave
+            reg [31:0] payload = 32'hDEAD_BEEF;
+            reg [3:0]  slave_drv;
+            forever begin
+                @(negedge vif.CS_n);
+                
+                // Wait for the programmed 6 clock cycles of dummy wait states
+                repeat(6) @(negedge vif.CLK);
+                
+                #1; // Delta-cycle safety
+                
+                // Shift out the 8 nibbles (MSB first) synced to the Master's clock
+                for (int i=7; i>=0; i--) begin 
+                    slave_drv = (payload >> (i*4)) & 4'hF; 
+                    vif.D3 <= slave_drv[3]; 
+                    vif.D2 <= slave_drv[2]; 
+                    vif.D1 <= slave_drv[1]; 
+                    vif.D0 <= slave_drv[0]; 
+                    
+                    if (i > 0) @(negedge vif.CLK); 
+                end
+                
+                @(posedge vif.CS_n); 
+                #1; 
+                // Release the pins back to the default tb_top pullups
+                vif.D3 <= 1'bz; vif.D2 <= 1'bz; vif.D1 <= 1'bz; vif.D0 <= 1'bz; 
             end
+        end
+
+        // ---------------------------------------------------------
+        // THREAD 2: QSPI Master APB Sequence
+        // ---------------------------------------------------------
+        begin : master_apb_sequence
             
-            @(posedge CS_n); 
-            slave_oe = 0; 
-            slave_drv = 4'hz;
+            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+            // Flush the FIFOs to remove ghost data left over from previous tests
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+            repeat(5) @(posedge vif.pclk);
+
+            $display("[INFO] --- STEP 1: Configuring QSPI Master Architecture ---");
+            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; agt.send_write(tx); // Clock Divider
+            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_0007; agt.send_write(tx); // Transfer Length (8 cycles)
+
+            $display("[INFO] --- STEP 2: Program Dummy Cycles and Trigger RX ---");
+            tx = new(); tx.paddr = 32'h14; tx.pwdata = 32'h0000_0006; agt.send_write(tx); // Program 6 Dummy Cycles
+            
+            // Trigger Quad Mode (Bits 14:13=00 [RX], Bit 10=1 [Quad], Bit 0=1 [Start]) -> 0x0401
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0401; agt.send_write(tx); 
+            
+            $display("[INFO] --- STEP 3: Actively Polling FSM Status ---");
+            // FIX: Proper CDC Delay & Polling Status Register (0x18) Bit 11
+            repeat(2) @(posedge vif.pclk);
+            timeout_ctr = 0;
+            do begin
+                tx = new(); tx.paddr = 32'h18; 
+                agt.send_read(tx);
+                @(posedge vif.pclk); 
+                timeout_ctr++;
+            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+            
+            $display("   [DEBUG] FSM returned to IDLE after %0d APB clock cycles.", timeout_ctr);
+
+            $display("[INFO] --- STEP 4: Extracting Payload from RX FIFO ---");
+            // Read the fetched payload from RX FIFO (0x08)
+            tx = new(); tx.paddr = 32'h08; 
+            agt.send_read(tx);
+            val = tx.prdata;
         end
+    join_any
+    
+    // Safety cleanup: Kill background slave and release pins immediately when sequence ends
+    disable fork; 
+    vif.D3 <= 1'bz; vif.D2 <= 1'bz; vif.D1 <= 1'bz; vif.D0 <= 1'bz; 
+
+    // =================================================================
+    // Evaluate and log the final outcome
+    // =================================================================
+    $display("[INFO] --- STEP 5: Final Result Evaluation ---");
+    if (timeout_ctr >= 1000) begin
+        $display("   [FAIL] Hardware locked up during dummy cycle test.\n");
+        test_pass = 1'b0;
+    end else if (val === 32'hDEAD_BEEF) begin
+        $display("   [PASS] Data correctly fetched after 6 wait states. Payload: %h\n", val);
+    end else begin
+        $display("   [FAIL] Expected DEADBEEF, Got: %h\n", val);
+        test_pass = 1'b0;
     end
 
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates the Dummy Clock Cycle generation logic. Programs the master
-    // to insert wait states (dummy cycles) between the instruction/address 
-    // phase and the data capture phase, ensuring the hardware properly 
-    // delays RX sampling to align with the delayed slave response.
-    // =====================================================================
-    initial begin
-        logic [31:0] val;
-        int timeout_ctr = 0;
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-PHY-DUM-22");
+    tb_top.scoreboard.mark_as_run("QSPI-PHY-DUM-22");
 
-        $dumpfile("dump_test_22.vcd"); 
-        $dumpvars(0, tb_test_22);
-        
-        $display("\n=======================================================================");
-        $display(" TEST 22: Dummy Clock Cycle Generation (Quad Mode)");
-        $display("=======================================================================\n");
-
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
-
-        apb_write(32'h14, 32'h0000_0006); // Program 6 Dummy Cycles
-        apb_write(32'h00, 32'h0000_0401); // Quad Enable (Bit 10) + RX Mode + Start
-        
-        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0) && timeout_ctr < 1000) begin
-            @(posedge pclk); timeout_ctr++;
-        end
-
-        apb_read(32'h08, val);
-
-        // Evaluation & Logging
-        if (val === 32'hDEAD_BEEF) begin
-            $display("   [PASS] Data correctly fetched after 6 wait states.\n");
-            update_summary("tb_test_22", 1);
-        end else begin
-            $display("   [FAIL] Expected DEADBEEF, Got: %h\n", val);
-            update_summary("tb_test_22", 0);
-        end
-        
-        #100 $finish;
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
     end
-endmodule
+endtask

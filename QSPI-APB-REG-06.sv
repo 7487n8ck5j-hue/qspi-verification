@@ -1,127 +1,127 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 06: SPI Fast Read Instruction Verification
+// TEST 06: SPI Fast Read Instruction Verification (QSPI-APB-REG-06)
+// Comprehensive validation of sequential TX/RX manual modes, Dummy Cycle 
+// routing, and continuous clock-edge sampling via MISO (D1).
 // =========================================================================
-module tb_test_06;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_06(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    logic [31:0] val;
+    int timeout_ctr = 0;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 06: SPI Fast Read Instruction Verification");
+    $display(" Target: QSPI-APB-REG-06 | Fast Read Sequence & Toggle Capture");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // Pullups simulate physical board resistors. D1 (MISO) has a pullup 
-    // but is also dynamically driven by the mock slave to simulate 
-    // incoming Flash data.
-    // =====================================================================
-    pullup(D3); pullup(D2); pullup(D0);
+    // We use fork..join_any to run the APB Master and a Custom Toggling Slave simultaneously.
+    fork
+        // ---------------------------------------------------------
+        // THREAD 1: Custom Toggling Slave (D1 / MISO)
+        // ---------------------------------------------------------
+        begin : custom_toggling_slave
+            reg slave_D1_val = 1'b1;
+            forever begin
+                // Wait for CS_n to go active
+                @(negedge vif.CS_n);
+                
+                // Keep toggling on every negative clock edge as long as CS_n is low
+                while (vif.CS_n == 1'b0) begin
+                    @(negedge vif.CLK);
+                    #1; // Delta-cycle safety
+                    slave_D1_val = ~slave_D1_val;
+                    vif.D1 <= slave_D1_val; 
+                end
+                
+                // Release the pin back to the default pullups when CS_n goes high
+                #1 vif.D1 <= 1'bz; 
+            end
+        end
+
+        // ---------------------------------------------------------
+        // THREAD 2: QSPI Master Sequence
+        // ---------------------------------------------------------
+        begin : master_apb_sequence
+            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+            repeat(5) @(posedge vif.pclk);
+            
+            $display("[INFO] --- STEP 1: Configuring Clock Divider ---");
+            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; agt.send_write(tx); 
+
+            $display("[INFO] --- STEP 2: Transmit Fast Read Opcode (TX Phase) ---");
+            // Pre-load TX FIFO
+            tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'h0B00_0000; agt.send_write(tx); 
+            
+            // FIX: Use Transfer Length Register (0x10), NOT Dummy Register (0x14)
+            // Set 7 for 8 clock cycles (1 byte opcode)
+            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_0007; agt.send_write(tx); 
+            
+            // FIX: Start TX-Only Mode (Bit 13=1, Bit 0=1) -> 0x2001
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_2001; agt.send_write(tx); 
+            
+            // Wait for QSPI FSM to idle using proper CDC delay and Status Reg (0x18)
+            repeat(2) @(posedge vif.pclk);
+            timeout_ctr = 0;
+            do begin
+                tx = new(); tx.paddr = 32'h18; 
+                agt.send_read(tx);
+                @(posedge vif.pclk); 
+                timeout_ctr++;
+            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+
+            $display("[INFO] --- STEP 3: Trigger RX to Capture Toggling Data ---");
+            // Set Transfer Length Register to 31 for 32 clock cycles (4 bytes)
+            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_001F; agt.send_write(tx); 
+            
+            // Start RX-Only Mode (Bits 14:13=0, Bit 0=1) -> 0x0001
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; agt.send_write(tx); 
+            
+            // Wait for QSPI FSM to idle using proper CDC delay and Status Reg (0x18)
+            repeat(2) @(posedge vif.pclk);
+            timeout_ctr = 0;
+            do begin
+                tx = new(); tx.paddr = 32'h18; 
+                agt.send_read(tx);
+                @(posedge vif.pclk); 
+                timeout_ctr++;
+            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+            
+            $display("[INFO] --- STEP 4: Extracting Payload from RX FIFO ---");
+            // Read the captured payload from the RX FIFO (0x08)
+            tx = new(); tx.paddr = 32'h08; 
+            agt.send_read(tx);
+            val = tx.prdata;
+        end
+    join_any
     
-    reg slave_D1 = 1'b1; reg slave_oe = 0;
-    assign D1 = slave_oe ? slave_D1 : 1'bz;
-    pullup(D1);
+    // Safety cleanup: Kill background slave and release pins immediately when sequence ends
+    disable fork; 
+    vif.D1 <= 1'bz; 
 
-    qspi_apb_master dut (.*);
-    always #5 pclk = ~pclk;
-
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write/read: Replicates a cycle-accurate AMBA APB protocol 
-    //   using a do-while loop to wait for pready assertion.
-    // =====================================================================
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
-
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0;
-    endtask
-
-    task automatic apb_read(input [31:0] addr, output logic [31:0] data);
-        @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0); 
-        data = prdata;
-        psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Mock SPI Flash Memory (The Slave)
-    // ---------------------------------------------------------------------
-    // This simple slave continually toggles the D1 (MISO) line on every 
-    // negative clock edge while CS_n is active. This produces a predictable 
-    // alternating bit pattern (e.g., 10101010) for the master to capture.
-    // =====================================================================
-    always @(negedge CLK) begin
-        if (CS_n == 1'b0) begin
-            slave_oe <= 1;
-            slave_D1 <= ~slave_D1;
-        end else begin
-            slave_oe <= 0;
-        end
+    // =================================================================
+    // Evaluate and log the final outcome
+    // =================================================================
+    if (timeout_ctr >= 1000) begin
+        $display("   [FAIL] Hardware locked up during Fast Read.");
+        test_pass = 1'b0;
+    end else if (val != 32'h0000_00FF && val != 32'h0000_0000) begin
+        $display("   [PASS] Fast Read Data Captured Successfully: %h\n", val);
+    end else begin
+        $display("   [FAIL] Expected Valid Data, Got: %h\n", val); 
+        test_pass = 1'b0;
     end
 
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates the standard Fast Read (0x0B) sequence. It transmits the 
-    // instruction opcode, configures the dummy byte length, triggers an 
-    // RX capture, and confirms that the toggling data from the slave 
-    // was correctly sampled rather than defaulting to all 1s or 0s.
-    // =====================================================================
-    initial begin
-        logic [31:0] val;
-        
-        $dumpfile("dump_test_06.vcd"); $dumpvars(0, tb_test_06);
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-APB-REG-06");
+    tb_top.scoreboard.mark_as_run("QSPI-APB-REG-06");
 
-        // 1. Transmit Fast Read Opcode (0x0B)
-        apb_write(32'h04, 32'h0B00_0000); 
-        apb_write(32'h14, 32'h0000_0001); // 1-Byte Length
-        apb_write(32'h00, 32'h0000_0003); // Start TX
-        
-        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0)) @(posedge pclk);
-        
-        // 2. Trigger RX to capture the incoming toggled data
-        apb_write(32'h14, 32'h0000_0001); // 1-Byte Length
-        apb_write(32'h00, 32'h0000_0001); // Start RX
-        
-        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0)) @(posedge pclk);
-        
-        // 3. Read the captured byte from the RX FIFO
-        apb_read(32'h08, val);
-
-        // 4. Verify it captured the toggling bit stream successfully
-        if (val != 32'h0000_00FF && val != 32'h0000_0000) begin
-            $display("   [PASS] Fast Read Data Captured Successfully: %h", val);
-            update_summary("tb_test_06", 1);
-        end else begin
-            $display("   [FAIL] Expected Valid Data, Got: %h", val); 
-            update_summary("tb_test_06", 0);
-        end
-        
-        #100 $finish;
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
     end
-endmodule
+endtask

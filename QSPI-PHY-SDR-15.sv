@@ -1,136 +1,112 @@
-`timescale 1ns/1ps
-
 // =========================================================================
-// TEST 15: Read Data Capturing via Internal Taps
+// TEST 15: Read Data Capturing via Internal Taps (QSPI-PHY-SDR-15)
+// Comprehensive diagnostic verification of RX-Only mode sampling, 
+// proper CDC-aware APB polling, and single-byte payload extraction.
 // =========================================================================
-module tb_test_15;
 
-    // =====================================================================
-    // Signal Declarations
-    // ---------------------------------------------------------------------
-    // Defines all the physical pins connecting to the QSPI Master.
-    // 'logic' is used for testbench-driven inputs, while 'wire' is used
-    // for outputs coming from the Design Under Test (DUT).
-    // =====================================================================
-    logic        pclk = 0, presetn = 0, psel = 0, penable = 0, pwrite = 0;
-    logic [31:0] paddr = 0, pwdata = 0; 
-    logic [3:0]  pstrb = 4'b1111;
-    logic        rx_dma_ack = 0, tx_dma_ack = 0;
+task automatic run_test_15(qspi_agent agt, virtual qspi_if vif);
+    qspi_transaction tx;
+    logic [31:0] val; 
+    int timeout_ctr = 0;
+    bit test_pass = 1'b1;
 
-    wire  [31:0] prdata; 
-    wire         pready, pslverr, irq, rx_dma_req, tx_dma_req;
-    wire         CS_n, CLK, FLASH_RST_n, D3, D2, D1, D0;
+    $display("\n=======================================================================");
+    $display(" TEST 15: QSPI-PHY-SDR-15");
+    $display(" Read Data Capturing via Internal Taps");
+    $display(" Validate data sampling bypassing the PHY Module.");
+    $display("=======================================================================\n");
 
-    // =====================================================================
-    // Bus Terminations & DUT Instantiation
-    // ---------------------------------------------------------------------
-    // Pullups simulate physical board resistors, preventing data lines from
-    // floating to an unknown 'x' state when the bus is idle. D1 (MISO) is 
-    // dynamically driven by the mock slave during read operations.
-    // =====================================================================
-    pullup(D3); pullup(D2); pullup(D1); pullup(D0); 
-
-    reg slave_D1 = 1'bz; reg slave_oe = 0;
-    assign D1 = slave_oe ? slave_D1 : 1'bz;
-
-    qspi_apb_master dut (.*);
-    
-    // Generate a 100MHz clock (Toggles every 5ns)
-    always #5 pclk = ~pclk;
-
-    // =====================================================================
-    // Reusable Verification Tasks
-    // ---------------------------------------------------------------------
-    // - update_summary: Safely writes the PASS/FAIL result to the log file.
-    // - apb_write/read: Replicates a cycle-accurate AMBA APB protocol 
-    //   using a do-while loop to robustly wait for pready assertion.
-    // =====================================================================
-    // Standardized Makefile Tracking
-    task automatic update_summary(input string test_name, input bit pass);
-        int fd = $fopen("regression_summary.txt", "a");
-        if (fd) begin
-            $fdisplay(fd, "%s: %s", test_name, pass ? "PASS" : "FAIL");
-            $fclose(fd);
-        end
-    endtask
-
-    // Robust AMBA Polling
-    task automatic apb_write(input [31:0] addr, input [31:0] data);
-        @(negedge pclk); psel=1; pwrite=1; paddr=addr; pwdata=data; pstrb=4'b1111;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        psel=0; penable=0;
-    endtask
-
-    // Robust AMBA Polling
-    task automatic apb_read(input [31:0] addr, output logic [31:0] data);
-        @(negedge pclk); psel=1; pwrite=0; paddr=addr; pstrb=4'b0000;
-        @(negedge pclk); penable=1; 
-        do begin @(negedge pclk); end while(pready == 1'b0);
-        data = prdata;
-        psel=0; penable=0;
-    endtask
-
-    // =====================================================================
-    // Mock SPI Flash Memory (The Slave)
-    // ---------------------------------------------------------------------
-    // Simulates a Flash memory driving a known payload (`0xFEED_BACC`) 
-    // serially on the D1 (MISO) line. The data is aligned immediately upon 
-    // CS_n going low and shifted on every subsequent negative clock edge.
-    // =====================================================================
-    // Mock Flash: Aligned to Immediate Shift Edge
-    initial begin
-        reg [31:0] payload = 32'hFEED_BACC;
-        forever begin
-            @(negedge CS_n);
-            slave_oe = 1;
-            for (int i=31; i>=0; i--) begin 
-                slave_D1 = payload[i]; // Drive data instantly
-                if (i > 0) @(negedge CLK); 
+    // We use fork..join_any to run the APB Master and a Custom SPI Slave simultaneously.
+    fork
+        // ---------------------------------------------------------
+        // THREAD 1: Custom SPI Mock Slave
+        // ---------------------------------------------------------
+        begin : custom_mock_slave
+            reg [31:0] payload = 32'hFEED_BACC;
+            forever begin
+                @(negedge vif.CS_n);
+                #1; // Delta-cycle safety
+                
+                // Shift out all 32 bits, even though the Master may only read 8
+                for (int i=31; i>=0; i--) begin 
+                    vif.D1 <= payload[i]; 
+                    if (i > 0) @(negedge vif.CLK); 
+                end
+                
+                @(posedge vif.CS_n); 
+                #1; vif.D1 <= 1'bz; // Release pin back to tb_top pullups
             end
-            @(posedge CS_n); 
-            slave_oe = 0; slave_D1 = 1'bz;
         end
+
+        // ---------------------------------------------------------
+        // THREAD 2: QSPI Master APB Sequence
+        // ---------------------------------------------------------
+        begin : master_apb_sequence
+            
+            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+            // Flush the FIFOs to remove ghost data left over from previous tests
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; 
+            agt.send_write(tx);
+            repeat(5) @(posedge vif.pclk);
+
+            $display("[INFO] --- STEP 1: Configuring Master Architecture ---");
+            // Clock Divider to 4
+            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; agt.send_write(tx); 
+            // Set Transfer Length to 7 (8 clock cycles total) to read exactly 1 byte
+            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_0007; agt.send_write(tx); 
+            
+            $display("[INFO] --- STEP 2: Triggering RX-Only Mode ---");
+            // Trigger RX (Bits 14:13=00 [RX Mode], Bit 0=1 [Start] -> 0x0001)
+            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; agt.send_write(tx); 
+            
+            $display("[INFO] --- STEP 3: Actively Polling FSM Status ---");
+            // FIX: Proper CDC Delay & Polling Status Register (0x18) Bit 11
+            repeat(2) @(posedge vif.pclk);
+            timeout_ctr = 0;
+            do begin
+                tx = new(); tx.paddr = 32'h18; 
+                agt.send_read(tx);
+                @(posedge vif.pclk); 
+                timeout_ctr++;
+            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+            
+            $display("   [DEBUG] FSM returned to IDLE after %0d APB clock cycles.", timeout_ctr);
+
+            $display("[INFO] --- STEP 4: Extracting Payload from RX FIFO ---");
+            // Read the captured byte from RX FIFO (0x08)
+            tx = new(); tx.paddr = 32'h08; 
+            agt.send_read(tx);
+            val = tx.prdata;
+        end
+    join_any
+    
+    // Safety cleanup: Kill background slave and release pin immediately when sequence ends
+    disable fork; 
+    vif.D1 <= 1'bz; 
+
+    // =================================================================
+    // Evaluate and log the final outcome
+    // =================================================================
+    $display("[INFO] --- STEP 5: Final Result Evaluation ---");
+    if (timeout_ctr >= 1000) begin
+        $display("   [FAIL] Hardware locked up during internal tap read.\n");
+        test_pass = 1'b0;
+    end else if (val === 32'h0000_00FE) begin
+        $display("   [PASS] Internal tap data captured successfully: %h\n", val);
+    end else begin
+        $display("   [FAIL] Expected 0000_00FE, Got: %h\n", val);
+        test_pass = 1'b0;
     end
 
-    // =====================================================================
-    // Main Test Sequence
-    // ---------------------------------------------------------------------
-    // Validates the internal RX sampling taps (bypassing the PHY module). 
-    // It initiates a standard RX transaction, waits for the hardware to 
-    // capture the default 8 bits per phase, and verifies that the top byte 
-    // of the payload (`0xFE`) is perfectly aligned and stored in the RX FIFO.
-    // =====================================================================
-    initial begin
-        logic [31:0] val; 
-        int timeout_ctr = 0;
-        
-        $dumpfile("dump_test_15.vcd"); $dumpvars(0, tb_test_15);
-        $display("\n=======================================================================");
-        $display(" TEST 15: QSPI-PHY-SDR-15");
-        $display(" Read Data Capturing via Internal Taps");
-        $display(" Validate data sampling bypassing the PHY Module.");
-        $display("=======================================================================\n");
+    // =================================================================
+    // Log final result to SystemVerilog Scoreboard
+    // =================================================================
+    tb_top.scoreboard.set_current_test("QSPI-PHY-SDR-15");
+    tb_top.scoreboard.mark_as_run("QSPI-PHY-SDR-15");
 
-        presetn = 0; #33; presetn = 1; @(posedge pclk);
-
-        apb_write(32'h00, 32'h0000_0001); // Start RX
-        
-        while ((dut.state != 3'd0 || dut.ctrl_reg[0] != 1'b0) && timeout_ctr < 1000) begin
-            @(posedge pclk); timeout_ctr++;
-        end
-
-        apb_read(32'h08, val);
-        
-        // RTL reads 8 bits per RX phase by default, so we expect the top 8 bits of FEED_BACC (0xFE)
-        if (val === 32'h0000_00FE) begin
-            $display("   [PASS] Internal tap data captured successfully: %h\n", val);
-            update_summary("tb_test_15", 1);
-        end else begin
-            $display("   [FAIL] Expected 0000_00FE, Got: %h\n", val);
-            update_summary("tb_test_15", 0);
-        end
-        
-        #100 $finish;
+    if (test_pass) begin
+        tb_top.scoreboard.set_test_pass(1'b1, "PASS");
+    end else begin
+        tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
     end
-endmodule
+endtask
