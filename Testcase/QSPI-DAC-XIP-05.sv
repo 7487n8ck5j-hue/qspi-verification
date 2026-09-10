@@ -1,6 +1,7 @@
 // =========================================================================
-// TEST 05: QSPI XIP Boot Instruction Fetch (QSPI-DAC-XIP-05) — CORRECTED
-// FIX: Remove hallucinated bit 14 (DAC Enable). Use valid Quad RX mode (0x0401).
+// TEST 05: QSPI XIP Boot Instruction Fetch (QSPI-DAC-XIP-05)
+// FIX: Removed local mock slave causing bus collision. Directed tb_top flash
+//      model to return the correct pattern via Quad Mode.
 // =========================================================================
 task automatic run_test_05(qspi_agent agt, virtual qspi_if vif);
     qspi_transaction tx;
@@ -12,55 +13,34 @@ task automatic run_test_05(qspi_agent agt, virtual qspi_if vif);
     $display(" TEST 05: QSPI XIP Boot Instruction Fetch (QSPI-DAC-XIP-05)");
     $display("=======================================================================\n");
 
-    fork
-        begin : custom_quad_slave
-            reg [31:0] payload = 32'h1A57_8C73;
-            reg [3:0]  slave_drv;
-            forever begin
-                @(negedge vif.CS_n);
-                repeat(6) @(negedge vif.CLK);
-                #1;
-                for (int i=7; i>=0; i--) begin
-                    slave_drv = (payload >> (i*4)) & 4'hF;
-                    vif.D3 <= slave_drv[3]; vif.D2 <= slave_drv[2];
-                    vif.D1 <= slave_drv[1]; vif.D0 <= slave_drv[0];
-                    if (i > 0) @(negedge vif.CLK);
-                end
-                @(posedge vif.CS_n);
-                #1;
-                vif.D3 <= 1'bz; vif.D2 <= 1'bz; vif.D1 <= 1'bz; vif.D0 <= 1'bz;
-            end
-        end
+    tb_top.flash_quad_mode = 1'b1;
+    tb_top.flash.set_pattern(32'h1A57_8C73);
+    tb_top.flash.set_delay(0); // RX-only transfer
 
-        begin : master_apb_sequence
-            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
-            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; tx.pstrb = 4'hF; agt.send_write(tx);
-            repeat(5) @(posedge vif.pclk);
+    $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; tx.pstrb = 4'hF; agt.send_write(tx);
+    repeat(5) @(posedge vif.pclk);
 
-            $display("[INFO] --- STEP 1: Configuring Master ---");
-            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; tx.pstrb = 4'hF; agt.send_write(tx);
-            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_001F; tx.pstrb = 4'hF; agt.send_write(tx);
+    $display("[INFO] --- STEP 1: Configuring Master ---");
+    tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; tx.pstrb = 4'hF; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_001F; tx.pstrb = 4'hF; agt.send_write(tx);
 
-            $display("[INFO] --- STEP 2: Triggering Quad RX Mode ---");
-            // FIX: Use valid Quad RX mode (Bit 10 + Bit 0 = 0x0401) instead of hallucinated bit 14
-            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0401; tx.pstrb = 4'hF; agt.send_write(tx);
+    $display("[INFO] --- STEP 2: Triggering Quad RX Mode ---");
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0401; tx.pstrb = 4'hF; agt.send_write(tx);
 
-            repeat(2) @(posedge vif.pclk);
-            timeout_ctr = 0;
-            do begin
-                tx = new(); tx.paddr = 32'h18; tx.pstrb = 4'hF; agt.send_read(tx);
-                @(posedge vif.pclk);
-                timeout_ctr++;
-            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+    repeat(2) @(posedge vif.pclk);
+    timeout_ctr = 0;
+    do begin
+        tx = new(); tx.paddr = 32'h18; tx.pstrb = 4'hF; agt.send_read(tx);
+        @(posedge vif.pclk);
+        timeout_ctr++;
+    end while (tx.prdata[20] == 1'b1 && timeout_ctr < 1000);
 
-            $display("[INFO] --- STEP 3: Reading Payload from RX FIFO ---");
-            tx = new(); tx.paddr = 32'h08; tx.pstrb = 4'hF; agt.send_read(tx);
-            val = tx.prdata;
-        end
-    join_any
+    $display("[INFO] --- STEP 3: Reading Payload from RX FIFO ---");
+    tx = new(); tx.paddr = 32'h08; tx.pstrb = 4'hF; agt.send_read(tx);
+    val = tx.prdata;
 
-    disable fork;
-    vif.D3 <= 1'bz; vif.D2 <= 1'bz; vif.D1 <= 1'bz; vif.D0 <= 1'bz;
+    tb_top.flash_quad_mode = 1'b0;
 
     if (timeout_ctr >= 1000) begin
         $display("   [FAIL] FSM locked up.\n");
@@ -77,4 +57,3 @@ task automatic run_test_05(qspi_agent agt, virtual qspi_if vif);
     if (test_pass) tb_top.scoreboard.set_test_pass(1'b1, "PASS");
     else tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
 endtask
-

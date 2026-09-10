@@ -1,6 +1,8 @@
 // =========================================================================
-// TEST 30: DAC Multi-Beat Write (QSPI-DAC-MBW-30) — CORRECTED
-// FIX: Renamed from QSPI-PHY-MBW-30 to QSPI-DAC-MBW-30
+// TEST 30: DAC Multi-Beat Write (QSPI-DAC-MBW-30)
+// FIX: Updated polling loop to Bit 20. Converted the mock slave into a purely
+//      passive CS_n toggle monitor. Changed CTRL register write to 0x2001 
+//      (TX-Only mode) so the Master actually executes a write transaction.
 // =========================================================================
 task automatic run_test_30(qspi_agent agt, virtual qspi_if vif);
     qspi_transaction tx;
@@ -14,19 +16,16 @@ task automatic run_test_30(qspi_agent agt, virtual qspi_if vif);
     $display(" Target: Validate multi-beat write through DAC path");
     $display("=======================================================================\n");
 
+    // Disable the global flash model so it doesn't try to intervene during writes
+    tb_top.flash_enable = 1'b0;
+
     fork
-        begin : mock_slave
+        begin : cs_monitor
+            // Purely passive monitor: count CS_n toggles without driving the bus
             forever begin
                 @(negedge vif.CS_n);
-                #1;
-                for (int i=31; i>=0; i--) begin
-                    vif.D1 <= 1'b1;
-                    if (i > 0) @(negedge vif.CLK);
-                end
                 beat_count++;
                 @(posedge vif.CS_n);
-                #1;
-                vif.D1 <= 1'bz;
             end
         end
 
@@ -39,11 +38,11 @@ task automatic run_test_30(qspi_agent agt, virtual qspi_if vif);
             tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; tx.pstrb = 4'hF; agt.send_write(tx);
             tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_001F; tx.pstrb = 4'hF; agt.send_write(tx);
 
-            // Send 4 beats of data
             $display("[INFO] --- STEP 2: Sending 4 Data Beats ---");
             for (int i = 0; i < 4; i++) begin
                 tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'hA5A5_0000 + i; tx.pstrb = 4'hF; agt.send_write(tx);
-                tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; tx.pstrb = 4'hF; agt.send_write(tx);
+                // FIX: Trigger TX-Only Mode (Bits 14:13=01 [TX], Bit 0=1 [Start]) -> 0x2001
+                tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_2001; tx.pstrb = 4'hF; agt.send_write(tx);
 
                 repeat(2) @(posedge vif.pclk);
                 timeout_ctr = 0;
@@ -51,13 +50,14 @@ task automatic run_test_30(qspi_agent agt, virtual qspi_if vif);
                     tx = new(); tx.paddr = 32'h18; tx.pstrb = 4'hF; agt.send_read(tx);
                     @(posedge vif.pclk);
                     timeout_ctr++;
-                end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+                // FIX: Poll Bit 20 instead of legacy Bit 11
+                end while (tx.prdata[20] == 1'b1 && timeout_ctr < 1000);
             end
         end
     join_any
 
     disable fork;
-    vif.D1 <= 1'bz;
+    tb_top.flash_enable = 1'b1;
 
     if (timeout_ctr >= 1000) begin
         $display("   [FAIL] FSM locked up during multi-beat write.\n");
@@ -74,4 +74,3 @@ task automatic run_test_30(qspi_agent agt, virtual qspi_if vif);
     if (test_pass) tb_top.scoreboard.set_test_pass(1'b1, "PASS");
     else tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
 endtask
-

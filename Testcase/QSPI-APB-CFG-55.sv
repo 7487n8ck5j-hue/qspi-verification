@@ -48,7 +48,8 @@ task automatic run_test_55(qspi_agent agt, virtual qspi_if vif);
                 tx = new(); tx.paddr = 32'h18; agt.send_read(tx);
                 @(posedge vif.pclk);
                 timeout_ctr++;
-            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+            // FIX: Poll Bit 20 to match the updated STATUS register map
+            end while (tx.prdata[20] == 1'b1 && timeout_ctr < 1000);
         end
     join_any
     disable fork;
@@ -77,4 +78,3 @@ task automatic run_test_55(qspi_agent agt, virtual qspi_if vif);
     else
         tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
 endtask
-

@@ -7,6 +7,9 @@
 //   [FIX-12] Added 'if (!busy)' protection to ctrl_reg[0] APB write logic to 
 //            prevent software from overwriting the FSM's auto-clear behavior
 //            during an active transaction, avoiding spurious restarts.
+//   [FIX-13] SPI CS_n Setup & Hold Timing Fix. Replaced the hardcoded 2-pclk 
+//            delay with `spi_tick` pacing. This ensures tCSS and tCSH strictly 
+//            scale with CLKDIV, preventing hold-time violations on slow SPI slaves.
 //=============================================================================
 `timescale 1ns/1ps
 
@@ -97,7 +100,9 @@ module qspi_apb_master (
             clk_div_cnt <= 16'd0;
             spi_tick    <= 1'b0;
         end else begin
-            if (state == ST_IDLE || state == ST_STOP || state == ST_CS_SETUP || state == ST_CS_HOLD) begin
+            // [FIX-13] Removed ST_CS_SETUP and ST_CS_HOLD so the clock divider 
+            // runs during CS edges, guaranteeing proper setup/hold timing.
+            if (state == ST_IDLE || state == ST_STOP) begin
                 clk_div_cnt <= 16'd0;
                 spi_tick    <= 1'b0;
             end else begin
@@ -331,7 +336,6 @@ module qspi_apb_master (
                 cycle_cnt    <= 6'd0;
                 dummy_cnt    <= 8'd0;
                 timer_cnt    <= 32'd0;
-                cs_timer     <= 4'd0;
 
                 tx_wr_ptr    <= 3'd0;
                 tx_rd_ptr    <= 3'd0;
@@ -386,7 +390,6 @@ module qspi_apb_master (
                     CS_n     <= 1'b1;
                     CLK      <= spi_cpol;
                     oe       <= 1'b0;
-                    cs_timer <= 4'd0;
                 end
                 else begin
                     case (state)
@@ -394,7 +397,6 @@ module qspi_apb_master (
                             CLK      <= ctrl_reg[9];
                             CS_n     <= 1'b1;
                             oe       <= 1'b0;
-                            cs_timer <= 4'd0;
 
                             if (ctrl_reg[0]) begin
                                 spi_cpol     <= ctrl_reg[9];
@@ -406,14 +408,13 @@ module qspi_apb_master (
                                 cycle_cnt    <= 6'd0;
 
                                 CS_n         <= 1'b0;
-                                cs_timer     <= 4'd0;
                                 state        <= ST_CS_SETUP;
                             end
                         end
 
                         ST_CS_SETUP: begin
-                            if (cs_timer >= 4'd1) begin
-                                cs_timer <= 4'd0;
+                            // [FIX-13] Wait precisely 1 spi_tick to scale setup time with baud rate
+                            if (spi_tick) begin
                                 case (spi_mode)
                                     2'b00: begin
                                         oe        <= 1'b0;
@@ -436,7 +437,6 @@ module qspi_apb_master (
                                     end
                                 endcase
                             end
-                            else cs_timer <= cs_timer + 1'b1;
                         end
 
                         ST_TX: begin
@@ -503,11 +503,10 @@ module qspi_apb_master (
                         ST_CS_HOLD: begin
                             CLK <= spi_cpol;
                             oe  <= 1'b0;
-                            if (cs_timer >= 4'd1) begin
-                                cs_timer <= 4'd0;
-                                state    <= ST_STOP;
+                            // [FIX-13] Wait precisely 1 spi_tick to scale hold time with baud rate
+                            if (spi_tick) begin
+                                state <= ST_STOP;
                             end
-                            else cs_timer <= cs_timer + 1'b1;
                         end
 
                         ST_STOP: begin

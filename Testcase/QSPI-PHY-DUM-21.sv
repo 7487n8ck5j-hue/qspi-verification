@@ -1,7 +1,8 @@
 // =========================================================================
 // TEST 21: Device Delay Calibration (QSPI-PHY-DUM-21)
-// Comprehensive validation of programmable CS# timing margins, correct 
-// TX-Only mode execution, and proper status register polling.
+// FIX: Updated FSM busy bit polling from legacy Bit 11 to Bit 20 so the 
+//      testbench actually waits for the transaction to complete before 
+//      evaluating the CS_n pin state.
 // =========================================================================
 
 task automatic run_test_21(qspi_agent agt, virtual qspi_if vif);
@@ -31,12 +32,11 @@ task automatic run_test_21(qspi_agent agt, virtual qspi_if vif);
     tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'h1234_5678; 
     agt.send_write(tx); 
     
-    // FIX: Trigger TX-Only Mode (Bits 14:13=01 [TX], Bit 0=1 [Start]) -> 0x2001
+    // Trigger TX-Only Mode (Bits 14:13=01 [TX], Bit 0=1 [Start]) -> 0x2001
     tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_2001; 
     agt.send_write(tx); 
 
     $display("[INFO] --- STEP 3: Actively Polling FSM Status ---");
-    // FIX: Proper CDC Delay & Polling Status Register (0x18) Bit 11 (Busy)
     repeat(2) @(posedge vif.pclk);
     timeout_ctr = 0;
     do begin
@@ -44,7 +44,8 @@ task automatic run_test_21(qspi_agent agt, virtual qspi_if vif);
         agt.send_read(tx);
         @(posedge vif.pclk); 
         timeout_ctr++;
-    end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+    // FIX: Poll Bit 20 instead of legacy Bit 11
+    end while (tx.prdata[20] == 1'b1 && timeout_ctr < 1000);
 
     $display("   [DEBUG] FSM returned to IDLE after %0d APB clock cycles.", timeout_ctr);
     repeat(5) @(posedge vif.pclk);

@@ -1,6 +1,7 @@
 // =========================================================================
-// TEST 12: Reset During Transfer Abort (QSPI-PHY-RST-12) — REWRITTEN
-// FIX: Was max toggle pressure test. Now tests mid-transfer reset abort.
+// TEST 12: Reset During Transfer Abort (QSPI-PHY-RST-12)
+// FIX: Reprogrammed the Master's configuration registers in Step 5 because 
+//      the hardware reset in Step 3 properly wiped them back to defaults.
 // =========================================================================
 task automatic run_test_12(qspi_agent agt, virtual qspi_if vif);
     qspi_transaction tx;
@@ -13,75 +14,64 @@ task automatic run_test_12(qspi_agent agt, virtual qspi_if vif);
     $display(" Target: Validate FSM returns to IDLE after mid-transfer reset");
     $display("=======================================================================\n");
 
-    fork
-        begin : mock_slave
-            reg [7:0] payload = 8'hCC;
-            forever begin
-                @(negedge vif.CS_n);
-                #1;
-                for (int i=7; i>=0; i--) begin
-                    vif.D1 <= payload[i];
-                    if (i > 0) @(negedge vif.CLK);
-                end
-                @(posedge vif.CS_n);
-                #1;
-                vif.D1 <= 1'bz;
-            end
-        end
+    // Enable the global flash model
+    tb_top.flash_enable = 1'b1;
+    tb_top.flash_quad_mode = 1'b0;
+    // Set response for the post-reset read 
+    tb_top.flash.set_pattern(32'hCC00_0000);
+    tb_top.flash.set_delay(0); // RX-ONLY transaction requires 0 delay
 
-        begin : master_sequence
-            $display("[INFO] --- STEP 0: Hardware Software Reset ---");
-            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; tx.pstrb = 4'hF; agt.send_write(tx);
-            repeat(5) @(posedge vif.pclk);
+    $display("[INFO] --- STEP 0: Hardware Software Reset ---");
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; tx.pstrb = 4'hF; agt.send_write(tx);
+    repeat(5) @(posedge vif.pclk);
 
-            $display("[INFO] --- STEP 1: Configuring Master ---");
-            tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; tx.pstrb = 4'hF; agt.send_write(tx);
-            tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_0007; tx.pstrb = 4'hF; agt.send_write(tx);
+    $display("[INFO] --- STEP 1: Configuring Master ---");
+    tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; tx.pstrb = 4'hF; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_0007; tx.pstrb = 4'hF; agt.send_write(tx);
 
-            $display("[INFO] --- STEP 2: Starting SPI Transaction ---");
-            tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'h0300_0000; tx.pstrb = 4'hF; agt.send_write(tx);
-            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; tx.pstrb = 4'hF; agt.send_write(tx);
+    $display("[INFO] --- STEP 2: Starting SPI Transaction ---");
+    tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'h0300_0000; tx.pstrb = 4'hF; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; tx.pstrb = 4'hF; agt.send_write(tx);
 
-            // Wait a few cycles then assert reset mid-transfer
-            repeat(3) @(posedge vif.pclk);
+    // Wait a few cycles then assert reset mid-transfer
+    repeat(3) @(posedge vif.pclk);
 
-            $display("[INFO] --- STEP 3: Asserting Hardware Reset Mid-Transfer ---");
-            vif.presetn = 1'b0;
-            repeat(10) @(posedge vif.pclk);
-            vif.presetn = 1'b1;
-            $display("[INFO] --- STEP 4: Reset Released, Checking FSM Recovery ---");
+    $display("[INFO] --- STEP 3: Asserting Hardware Reset Mid-Transfer ---");
+    vif.presetn = 1'b0;
+    repeat(10) @(posedge vif.pclk);
+    vif.presetn = 1'b1;
+    $display("[INFO] --- STEP 4: Reset Released, Checking FSM Recovery ---");
 
-            repeat(5) @(posedge vif.pclk);
+    repeat(5) @(posedge vif.pclk);
 
-            // Check Status Register — FSM should be IDLE (bit 11 = 0)
-            tx = new(); tx.paddr = 32'h18; tx.pstrb = 4'hF; agt.send_read(tx);
-            val = tx.prdata;
+    // Check Status Register — FSM should be IDLE (bit 20 = 0)
+    tx = new(); tx.paddr = 32'h18; tx.pstrb = 4'hF; agt.send_read(tx);
+    val = tx.prdata;
 
-            if (val[11] == 1'b0) begin
-                $display("   [DEBUG] FSM is IDLE after reset. Status: %h", val);
-            end else begin
-                $display("   [DEBUG] FSM still BUSY after reset. Status: %h", val);
-            end
+    if (val[20] == 1'b0) begin
+        $display("   [DEBUG] FSM is IDLE after reset. Status: %h", val);
+    end else begin
+        $display("   [DEBUG] FSM still BUSY after reset. Status: %h", val);
+    end
 
-            $display("[INFO] --- STEP 5: Attempting New Transaction After Reset ---");
-            tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'h0300_0000; tx.pstrb = 4'hF; agt.send_write(tx);
-            tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; tx.pstrb = 4'hF; agt.send_write(tx);
+    $display("[INFO] --- STEP 5: Reconfiguring Master & Attempting New Transaction ---");
+    // FIX: Must reprogram configuration registers wiped by the hardware reset!
+    tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_0004; tx.pstrb = 4'hF; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h10; tx.pwdata = 32'h0000_0007; tx.pstrb = 4'hF; agt.send_write(tx);
 
-            repeat(2) @(posedge vif.pclk);
-            timeout_ctr = 0;
-            do begin
-                tx = new(); tx.paddr = 32'h18; tx.pstrb = 4'hF; agt.send_read(tx);
-                @(posedge vif.pclk);
-                timeout_ctr++;
-            end while (tx.prdata[11] == 1'b1 && timeout_ctr < 1000);
+    tx = new(); tx.paddr = 32'h04; tx.pwdata = 32'h0300_0000; tx.pstrb = 4'hF; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0001; tx.pstrb = 4'hF; agt.send_write(tx);
 
-            tx = new(); tx.paddr = 32'h08; tx.pstrb = 4'hF; agt.send_read(tx);
-            val = tx.prdata;
-        end
-    join_any
+    repeat(2) @(posedge vif.pclk);
+    timeout_ctr = 0;
+    do begin
+        tx = new(); tx.paddr = 32'h18; tx.pstrb = 4'hF; agt.send_read(tx);
+        @(posedge vif.pclk);
+        timeout_ctr++;
+    end while (tx.prdata[20] == 1'b1 && timeout_ctr < 1000);
 
-    disable fork;
-    vif.D1 <= 1'bz;
+    tx = new(); tx.paddr = 32'h08; tx.pstrb = 4'hF; agt.send_read(tx);
+    val = tx.prdata;
 
     if (timeout_ctr >= 1000) begin
         $display("   [FAIL] FSM did not recover after mid-transfer reset.\n");
@@ -98,4 +88,3 @@ task automatic run_test_12(qspi_agent agt, virtual qspi_if vif);
     if (test_pass) tb_top.scoreboard.set_test_pass(1'b1, "PASS");
     else tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
 endtask
-

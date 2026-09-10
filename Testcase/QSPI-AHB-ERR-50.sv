@@ -14,7 +14,7 @@ task automatic run_test_50(qspi_agent agt, virtual qspi_if vif);
     $display("=======================================================================\n");
 
     $display("[INFO] --- STEP 0: Hardware Software Reset ---");
-    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_0100; tx.pstrb = 4'hF; agt.send_write(tx);
     repeat(5) @(posedge vif.pclk);
 
     $display("[INFO] --- STEP 1: Attempting Unaligned Read (0x01) ---");
@@ -26,16 +26,17 @@ task automatic run_test_50(qspi_agent agt, virtual qspi_if vif);
     end
 
     $display("[INFO] --- STEP 2: Attempting Unaligned Write (0x03) ---");
-    tx = new(); tx.paddr = 32'h0000_0003; tx.pwdata = 32'hDEAD_BEEF; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h0000_0003; tx.pwdata = 32'hDEAD_BEEF; tx.pstrb = 4'hF; agt.send_write(tx);
     if (tx.pslverr === 1'b1) begin
         $display("   [PASS] Unaligned write correctly rejected with PSLVERR.");
     end else begin
         $display("   [WARN] Unaligned write not rejected.");
     end
 
-    $display("[INFO] --- STEP 3: Byte-Level Write via pstrb (0x00, pstrb=4'h1) ---");
-    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_00AB; tx.pstrb = 4'h1; agt.send_write(tx);
-    tx = new(); tx.paddr = 32'h00; agt.send_read(tx);
+    // FIX: Target CLKDIV (0x0C) instead of CTRL (0x00) for byte-level write
+    $display("[INFO] --- STEP 3: Byte-Level Write via pstrb (CLKDIV 0x0C, pstrb=4'h1) ---");
+    tx = new(); tx.paddr = 32'h0C; tx.pwdata = 32'h0000_00AB; tx.pstrb = 4'h1; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h0C; tx.pstrb = 4'hF; agt.send_read(tx);
     if (tx.prdata[7:0] === 8'hAB) begin
         $display("   [PASS] Byte-level write via pstrb verified. Byte 0 = 0xAB");
     end else begin
@@ -43,9 +44,10 @@ task automatic run_test_50(qspi_agent agt, virtual qspi_if vif);
         test_pass = 1'b0;
     end
 
-    $display("[INFO] --- STEP 4: Half-Word Write via pstrb (0x00, pstrb=4'h3) ---");
-    tx = new(); tx.paddr = 32'h00; tx.pwdata = 32'h0000_CDEF; tx.pstrb = 4'h3; agt.send_write(tx);
-    tx = new(); tx.paddr = 32'h00; agt.send_read(tx);
+    // FIX: Target TIMEOUT (0x24) instead of CTRL (0x00) for half-word write
+    $display("[INFO] --- STEP 4: Half-Word Write via pstrb (TIMEOUT 0x24, pstrb=4'h3) ---");
+    tx = new(); tx.paddr = 32'h24; tx.pwdata = 32'h0000_CDEF; tx.pstrb = 4'h3; agt.send_write(tx);
+    tx = new(); tx.paddr = 32'h24; tx.pstrb = 4'hF; agt.send_read(tx);
     if (tx.prdata[15:0] === 16'hCDEF) begin
         $display("   [PASS] Half-word write via pstrb verified. Bytes [1:0] = 0xCDEF\n");
     end else begin
@@ -60,4 +62,3 @@ task automatic run_test_50(qspi_agent agt, virtual qspi_if vif);
     else
         tb_top.scoreboard.set_test_pass(1'b0, "FAIL");
 endtask
-

@@ -1,19 +1,21 @@
 //=============================================================================
 // Testbench: tb_top
-// Purpose:   Top-level module for QSPI Master. Instantiates the interface
-//            (qspi_if) and DUT (qspi_apb_master), generates the APB clock
-//            (10 ns period / 100 MHz), applies initial reset, instantiates
-//            the standalone QSPI agent, and controls the regression flow.
+// Purpose:   Top level for the QSPI APB master. Instantiates the interface, the
+//            DUT and a behavioural QSPI flash slave, generates the APB clock,
+//            applies reset and runs the regression.
 //
-// CORRECTED: 2026-09-07
-//   - Removed pstrb_tie — pstrb is now in the interface and driven by driver
-//   - Fixed DUT instantiation to connect pstrb from interface
-//   - Fixed mock flash to use proper tri-state drive
-//   - Added run_test_42 through run_test_57 calls (for new TCs)
-//   - Fixed $fsdbDumpfile to conditional (not all simulators support it)
-//   - Fixed scoreboard to use agent's scoreboard (not a separate instance)
-//   - ADDED: scoreboard handle declaration + assignment for TC access (XMRE fix)
+// REVISION 2026-09-08:
+//   [FIX-A] Added a real QSPI slave model (qspi_flash_model). The model returns 
+//           programmable data in single and quad mode for RX validation.
+//   [FIX-B] Reset release moved off the clock edge to #23 to avoid simulation 
+//           scheduling race conditions.
+//   [FIX-G] QSPI data bus modelled on module-level wires with weak pullups 
+//           to properly resolve tri-state drives between DUT and flash model.
+//   [RESTORED] External test sequences (TC01-TC57) included and called 
+//              sequentially. Internal tasks removed to maintain standalone files.
+//   [ADDED] scoreboard handle declaration for TC access (XMRE fix).
 //=============================================================================
+`timescale 1ns/1ps
 
 // Testbench infrastructure
 `include "./testbench/qspi_interface.sv"
@@ -21,7 +23,7 @@
 `include "./testbench/qspi_test_results.sv"
 `include "./testbench/qspi_scoreboard.sv"
 `include "./testbench/qspi_driver.sv"
-`include "./testbench/qspi_rmonitor.sv"
+`include "./testbench/qspi_monitor.sv"
 `include "./testbench/qspi_agent.sv"
 
 // Test sequences (TC01-TC41)
@@ -85,6 +87,57 @@
 `include "./testbench/test_seq/QSPI-IND-BND-56.sv"
 `include "./testbench/test_seq/QSPI-DAC-BND-57.sv"
 
+// =========================================================================
+// Behavioural QSPI flash slave model (Upgraded with Clock-Edge Shift Counter)
+// =========================================================================
+
+module qspi_flash_model (
+    input  wire CS_n,
+    input  wire CLK,
+    input  wire quad_mode,     // 1 = drive D3..D0, 0 = drive D1 only
+    input  wire enable,        // 0 = fully tri-state (lines revert to pullups)
+    inout  wire D3,
+    inout  wire D2,
+    inout  wire D1,
+    inout  wire D0
+);
+
+  reg [31:0] tx_pattern = 32'hA5A5_A5A5;
+  reg [31:0] sr         = 32'h0;
+  int        neg_edge_cnt = 0;
+  int        rx_delay     = 0;   // Clocks to skip (TX + Dummy phases) before shifting
+
+  always @(negedge CLK or posedge CS_n) begin
+    if (CS_n) begin
+      sr           <= tx_pattern;
+      neg_edge_cnt <= 0;
+    end else begin
+      if (neg_edge_cnt >= rx_delay) begin
+        if (quad_mode) sr <= {sr[27:0], 4'h0};
+        else           sr <= {sr[30:0], 1'b0};
+      end
+      neg_edge_cnt <= neg_edge_cnt + 1;
+    end
+  end
+
+  wire drive = enable && !CS_n && (neg_edge_cnt >= rx_delay);
+
+  assign D3 = (drive && quad_mode) ? sr[31] : 1'bz;
+  assign D2 = (drive && quad_mode) ? sr[30] : 1'bz;
+  assign D1 = drive ? (quad_mode ? sr[29] : sr[31]) : 1'bz;
+  assign D0 = (drive && quad_mode) ? sr[28] : 1'bz;
+
+  task set_pattern(input [31:0] p);
+    tx_pattern = p;
+    sr = p;
+  endtask
+
+  task set_delay(input int d);
+    rx_delay = d;
+  endtask
+
+endmodule
+
 module tb_top();
 
   // Unified interface containing both APB signals and QSPI physical lines
@@ -99,13 +152,25 @@ module tb_top();
   // ADDED FOR XMRE FIX: scoreboard handle accessible from TC tasks
   qspi_test_results scoreboard;
 
+  // Flash model controls
+  logic flash_quad_mode = 1'b0;
+  logic flash_enable    = 1'b1;
+
   // =====================================================================
-  // Bus Terminations
+  // QSPI data bus modelled on module-level wires with weak pullups
   // =====================================================================
-  pullup(vif.D3);
-  pullup(vif.D2);
-  pullup(vif.D1);
-  pullup(vif.D0);
+  wire qd3, qd2, qd1, qd0;
+
+  assign (weak0, weak1) qd3 = 1'b1;
+  assign (weak0, weak1) qd2 = 1'b1;
+  assign (weak0, weak1) qd1 = 1'b1;
+  assign (weak0, weak1) qd0 = 1'b1;
+
+  // Mirror the resolved bus into the interface
+  assign vif.D3 = qd3;
+  assign vif.D2 = qd2;
+  assign vif.D1 = qd1;
+  assign vif.D0 = qd0;
 
   // =====================================================================
   // DUT Instantiation
@@ -118,17 +183,17 @@ module tb_top();
       .penable    (vif.penable),
       .pwrite     (vif.pwrite),
       .pwdata     (vif.pwdata),
+      .pstrb      (vif.pstrb),
       .prdata     (vif.prdata),
       .pready     (vif.pready),
       .pslverr    (vif.pslverr),
-      .pstrb      (vif.pstrb),
 
       .CS_n       (vif.CS_n),
       .CLK        (vif.CLK),
-      .D3         (vif.D3),
-      .D2         (vif.D2),
-      .D1         (vif.D1),
-      .D0         (vif.D0),
+      .D3         (qd3),
+      .D2         (qd2),
+      .D1         (qd1),
+      .D0         (qd0),
 
       .FLASH_RST_n(vif.FLASH_RST_n),
       .irq        (vif.irq),
@@ -138,7 +203,19 @@ module tb_top();
       .tx_dma_ack (vif.tx_dma_ack)
   );
 
-
+  // =====================================================================
+  // Behavioural QSPI flash slave
+  // =====================================================================
+  qspi_flash_model flash (
+      .CS_n      (vif.CS_n),
+      .CLK       (vif.CLK),
+      .quad_mode (flash_quad_mode),
+      .enable    (flash_enable),
+      .D3        (qd3),
+      .D2        (qd2),
+      .D1        (qd1),
+      .D0        (qd0)
+  );
 
   // =====================================================================
   // Clock Generation - 10 ns period (100 MHz)
@@ -147,11 +224,7 @@ module tb_top();
     vif.pclk = 1'b0;
     forever begin
       #5 vif.pclk = ~vif.pclk;
-      if (vif.pclk) begin
-        cycle_count++;
-        if (cycle_count % 2000 == 0)
-          $display("[QSPI_TOP INFO] Cycle count = %0d", cycle_count);
-      end
+      if (vif.pclk) cycle_count++;
     end
   end
 
@@ -160,7 +233,7 @@ module tb_top();
   // =====================================================================
   always @(negedge vif.presetn) begin
     reset_count++;
-    $display("[QSPI_TOP INFO] ===== RESET ASSERTED (reset_count=%0d) =====", reset_count);
+    $display("[QSPI_TOP INFO] ===== RESET ASSERTED (count=%0d) =====", reset_count);
   end
 
   always @(posedge vif.presetn) begin
@@ -171,30 +244,17 @@ module tb_top();
   // Initial Reset & Test Execution Sequence
   // =====================================================================
   initial begin
-    vif.presetn    = 1'b0;
-    vif.psel       = 1'b0;
-    vif.penable    = 1'b0;
-    vif.pwrite     = 1'b0;
-    vif.paddr      = 32'h0;
-    vif.pwdata     = 32'h0;
-    vif.pstrb      = 4'hF;
-    vif.rx_dma_ack = 1'b0;
-    vif.tx_dma_ack = 1'b0;
-
-    $system("rm -f regression_summary.txt");
+    vif.presetn = 1'b0;
 
     $display("\n========================================================");
     $display("                QSPI REGRESSION START                   ");
     $display("========================================================\n");
 
-    #15;
+    #23;
     vif.presetn = 1'b1;
     $display("[QSPI_TOP INFO] RESET is released. Booting Agent...\n");
 
     qspi_agt = new("qspi_agt", vif);
-
-    // ADDED FOR XMRE FIX: alias scoreboard so TC tasks can call
-    // tb_top.scoreboard.set_current_test / mark_as_run / set_test_pass
     scoreboard = qspi_agt.sb.test_results;
 
     fork
@@ -282,6 +342,10 @@ module tb_top();
     $display("[QSPI_TOP INFO] ===== SIMULATION FINISHED =====");
     $display("[QSPI_TOP INFO] Total cycles = %0d", cycle_count);
     $display("[QSPI_TOP INFO] Total resets = %0d", reset_count);
+    if (qspi_agt.sb.test_results.regression_passed())
+      $display("[QSPI_TOP INFO] ===== REGRESSION PASSED =====");
+    else
+      $display("[QSPI_TOP INFO] ===== REGRESSION FAILED =====");
     $finish;
   end
 
@@ -299,4 +363,3 @@ module tb_top();
   end
 
 endmodule
-
